@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: oscpipe
+Version: 0.1.0
+Summary: OSC DFT pipeline for the Smart Ring Prototype — SMILES → Gaussian → properties.
+Requires-Python: >=3.11
+Requires-Dist: ase>=3.28
+Requires-Dist: rdkit>=2024.3
+Requires-Dist: openbabel-wheel>=3.1
+Requires-Dist: numpy>=1.26
+Requires-Dist: scipy>=1.13
+Requires-Dist: matplotlib>=3.8
+Requires-Dist: paramiko>=3.4
+Requires-Dist: streamlit>=1.30
+Requires-Dist: pandas>=2.2
+Provides-Extra: dev
+Requires-Dist: pytest>=8.0; extra == "dev"
+Requires-Dist: ruff>=0.5; extra == "dev"

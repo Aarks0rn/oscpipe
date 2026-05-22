@@ -1,0 +1,41 @@
+[project]
+name = "oscpipe"
+version = "0.1.0"
+description = "OSC DFT pipeline for the Smart Ring Prototype — SMILES → Gaussian → properties."
+requires-python = ">=3.11"
+dependencies = [
+    "ase>=3.28",
+    "rdkit>=2024.3",
+    "openbabel-wheel>=3.1",
+    "numpy>=1.26",
+    "scipy>=1.13",
+    "matplotlib>=3.8",
+    "paramiko>=3.4",
+    "streamlit>=1.30",
+    "pandas>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5"]
+
+[project.scripts]
+oscpipe = "oscpipe.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
