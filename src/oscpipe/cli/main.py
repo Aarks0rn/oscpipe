@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
     uv = sub.add_parser("uvvis", help="TDDFT excited states")
     uv.add_argument("smiles")
     uv.add_argument("--nstates", type=int, default=10)
+    uv.add_argument("--method", default="b3lyp")
 
     sub.add_parser("status", help="print job table")
     sub.add_parser("preflight", help="workstation health check")
@@ -115,6 +116,11 @@ def _rehydrate(backend, settings: Settings, rows: Iterable) -> None:
         if not r["ssh_jobid"]:
             continue
         label = _label(r["smiles"], r["signature"])
+        # Lambda workflow notes are plain identifiers used as label suffixes
+        # (e.g. "neutral_opt", "cation_at_neutral_geom"). Metadata notes like
+        # "nstates=10" contain "=" and must NOT be appended to the label.
+        if r["notes"] and "=" not in r["notes"]:
+            label = f"{label}_{r['notes']}"
         backend._jobs[r["ssh_jobid"]] = _remote_log_path(settings, label)
 
 
@@ -125,6 +131,8 @@ def _process_completion(conn, settings: Settings, backend, row, *, stdout: IO[st
     spectra_json; everything else parses properties (HOMO/LUMO/gap/dipole/E).
     """
     label = _label(row["smiles"], row["signature"])
+    if row["notes"] and "=" not in row["notes"]:
+        label = f"{label}_{row['notes']}"
     local_log = backend.fetch_log(row["ssh_jobid"], label, str(_log_dir(settings)))
     try:
         if row["job_kind"] == "tddft":
@@ -298,9 +306,10 @@ def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
     for w in warnings:
         print(f"warning: {w}", file=stdout)
 
+    method = args.method.lower()
     sig = signature(
         canonical,
-        "b3lyp",  # default TDDFT method/basis matches handoff scope
+        method,
         "6-31g*",
         0,
         1,
@@ -323,7 +332,7 @@ def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
     label = _label(canonical, sig)
     com_text = gaussian.write_com_tddft(
         atoms,
-        method="b3lyp",
+        method=method,
         basis="6-31g*",
         charge=0,
         mult=1,
@@ -341,7 +350,7 @@ def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
             id=None,
             signature=sig,
             smiles=canonical,
-            method="b3lyp",
+            method=method,
             basis="6-31g*",
             charge=0,
             mult=1,
