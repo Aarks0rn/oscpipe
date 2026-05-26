@@ -12,8 +12,8 @@ from oscpipe.settings import Settings
 from oscpipe.store import db
 
 
-def _args(smiles: str, nstates: int = 3):
-    return argparse.Namespace(smiles=smiles, nstates=nstates)
+def _args(smiles: str, nstates: int = 3, method: str = "b3lyp"):
+    return argparse.Namespace(smiles=smiles, nstates=nstates, method=method)
 
 
 def _setup(tmp_path):
