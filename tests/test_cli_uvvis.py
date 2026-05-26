@@ -12,8 +12,10 @@ from oscpipe.settings import Settings
 from oscpipe.store import db
 
 
-def _args(smiles: str, nstates: int = 3, method: str = "b3lyp"):
-    return argparse.Namespace(smiles=smiles, nstates=nstates, method=method)
+def _args(smiles: str, nstates: int = 3, method: str = "b3lyp", from_log=None):
+    return argparse.Namespace(
+        smiles=smiles, nstates=nstates, method=method, from_log=from_log
+    )
 
 
 def _setup(tmp_path):
@@ -75,6 +77,92 @@ def test_uvvis_different_nstates_no_cache_collide(tmp_path):
     run_uvvis(_args("c1ccccc1", nstates=5), s, backend, conn)
     n = conn.execute("SELECT count(*) FROM jobs").fetchone()[0]
     assert n == 2
+
+
+def test_uvvis_from_log_reuses_geometry_skipping_embed(tmp_path, capsys):
+    """--from-log path: geometry_loader fires, RDKit embed is bypassed."""
+    s, backend, conn = _setup(tmp_path)
+    fake_log = tmp_path / "neutral_opt.log"
+    fake_log.write_text("stub")
+
+    calls: list[tuple[str, str]] = []
+
+    def loader(log_path: str, canonical: str):
+        calls.append((log_path, canonical))
+        from oscpipe.chem.smiles import embed_3d
+
+        return embed_3d(canonical)
+
+    rc = run_uvvis(
+        _args("c1ccccc1", nstates=3, from_log=str(fake_log)),
+        s,
+        backend,
+        conn,
+        geometry_loader=loader,
+    )
+    assert rc == 0
+    assert len(calls) == 1 and calls[0][0] == str(fake_log)
+    out = capsys.readouterr().out
+    assert "reusing geometry from" in out
+
+
+def test_uvvis_from_log_validator_rejects_atom_mismatch(tmp_path):
+    """_atoms_from_log_validated raises on element-multiset mismatch."""
+    from oscpipe.cli.main import _atoms_from_log_validated
+
+    # Build a "log" whose ASE-read result is methane (CH4); SMILES says benzene.
+    fake_log = tmp_path / "wrong_molecule.log"
+    fake_log.write_text("stub")
+
+    import pytest
+    from oscpipe.chem.smiles import embed_3d
+
+    def fake_reader(_path):
+        return embed_3d("C")  # methane: 1 C, 4 H
+
+    import oscpipe.cli.main as cli_main
+
+    real_reader = cli_main._ase_read_gaussian
+    cli_main._ase_read_gaussian = fake_reader
+    try:
+        with pytest.raises(ValueError, match="atom multiset mismatch"):
+            _atoms_from_log_validated(str(fake_log), "c1ccccc1")  # benzene: 6 C, 6 H
+    finally:
+        cli_main._ase_read_gaussian = real_reader
+
+
+def test_uvvis_from_log_validator_accepts_matching_atoms(tmp_path):
+    """_atoms_from_log_validated passes when atom multiset matches the SMILES."""
+    from oscpipe.cli.main import _atoms_from_log_validated
+
+    fake_log = tmp_path / "benzene_opt.log"
+    fake_log.write_text("stub")
+
+    from oscpipe.chem.smiles import embed_3d
+
+    def fake_reader(_path):
+        return embed_3d("c1ccccc1")
+
+    import oscpipe.cli.main as cli_main
+
+    real_reader = cli_main._ase_read_gaussian
+    cli_main._ase_read_gaussian = fake_reader
+    try:
+        atoms = _atoms_from_log_validated(str(fake_log), "c1ccccc1")
+        assert atoms is not None
+        assert len(atoms.get_chemical_symbols()) > 0
+    finally:
+        cli_main._ase_read_gaussian = real_reader
+
+
+def test_uvvis_from_log_missing_file_raises(tmp_path):
+    """_atoms_from_log_validated raises FileNotFoundError for a missing log."""
+    from oscpipe.cli.main import _atoms_from_log_validated
+
+    import pytest
+
+    with pytest.raises(FileNotFoundError, match="does not exist"):
+        _atoms_from_log_validated(str(tmp_path / "nope.log"), "c1ccccc1")
 
 
 def test_uvvis_does_not_collide_with_properties_cache(tmp_path):

@@ -57,6 +57,17 @@ def build_parser() -> argparse.ArgumentParser:
     uv.add_argument("smiles")
     uv.add_argument("--nstates", type=int, default=10)
     uv.add_argument("--method", default="b3lyp")
+    uv.add_argument(
+        "--from-log",
+        dest="from_log",
+        default=None,
+        help=(
+            "Reuse the final optimised geometry from this Gaussian .log "
+            "(typically the neutral_opt.log produced by `oscpipe lambda`) "
+            "instead of running a fresh RDKit 3D embed. Atom count and "
+            "element multiset must match the SMILES."
+        ),
+    )
 
     sub.add_parser("status", help="print job table")
     sub.add_parser("preflight", help="workstation health check")
@@ -299,9 +310,19 @@ def run_submit(args, settings: Settings, backend, conn, *, stdout=None, workflow
 # ── uvvis ──────────────────────────────────────────────────────────────────
 
 
-def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
+def run_uvvis(
+    args,
+    settings: Settings,
+    backend,
+    conn,
+    *,
+    stdout=None,
+    geometry_loader=None,
+) -> int:
     if stdout is None:
         stdout = sys.stdout
+    if geometry_loader is None:
+        geometry_loader = _atoms_from_log_validated
     canonical, warnings = chem_smiles.canonicalise(args.smiles)
     for w in warnings:
         print(f"warning: {w}", file=stdout)
@@ -328,7 +349,12 @@ def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
         )
         return 0
 
-    atoms = chem_smiles.embed_3d(canonical)
+    from_log = getattr(args, "from_log", None)
+    if from_log:
+        atoms = geometry_loader(from_log, canonical)
+        print(f"uvvis: reusing geometry from {from_log}", file=stdout)
+    else:
+        atoms = chem_smiles.embed_3d(canonical)
     label = _label(canonical, sig)
     com_text = gaussian.write_com_tddft(
         atoms,
@@ -451,6 +477,39 @@ def _ase_read_gaussian(log_path: str):
     import ase.io
 
     return ase.io.read(log_path, format="gaussian-out")
+
+
+def _atoms_from_log_validated(log_path: str, canonical_smiles: str):
+    """Load the final optimised geometry from a Gaussian .log and sanity-check
+    that its atom multiset matches what `canonical_smiles` would produce.
+
+    Raises ``FileNotFoundError`` if the log is missing, ``ValueError`` if the
+    log cannot be parsed by ASE or the atom multiset does not match the SMILES.
+    Full connectivity is not checked — bond perception from coordinates is
+    fragile for conjugated systems, so we settle for atom count + element
+    multiset which catches the "wrong log file" failure mode cleanly.
+    """
+    from collections import Counter
+    from pathlib import Path
+
+    p = Path(log_path)
+    if not p.exists():
+        raise FileNotFoundError(f"--from-log: {log_path} does not exist")
+    try:
+        atoms = _ase_read_gaussian(log_path)
+    except Exception as e:
+        raise ValueError(f"--from-log: could not parse {log_path}: {e}") from e
+
+    reference = chem_smiles.embed_3d(canonical_smiles)
+    got = Counter(atoms.get_chemical_symbols())
+    want = Counter(reference.get_chemical_symbols())
+    if got != want:
+        raise ValueError(
+            f"--from-log: atom multiset mismatch between {log_path} and SMILES "
+            f"{canonical_smiles!r}. log has {dict(got)}, SMILES wants {dict(want)}. "
+            f"Is this the right .log for this molecule?"
+        )
+    return atoms
 
 
 def run_lambda(
