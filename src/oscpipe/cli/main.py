@@ -310,7 +310,7 @@ def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
     sig = signature(
         canonical,
         method,
-        "6-31g*",
+        "6-31g**",
         0,
         1,
         job_kind="tddft",
@@ -333,7 +333,7 @@ def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
     com_text = gaussian.write_com_tddft(
         atoms,
         method=method,
-        basis="6-31g*",
+        basis="6-31g**",
         charge=0,
         mult=1,
         nstates=args.nstates,
@@ -351,7 +351,7 @@ def run_uvvis(args, settings: Settings, backend, conn, *, stdout=None) -> int:
             signature=sig,
             smiles=canonical,
             method=method,
-            basis="6-31g*",
+            basis="6-31g**",
             charge=0,
             mult=1,
             job_kind="tddft",
@@ -484,7 +484,7 @@ def run_lambda(
         print(f"warning: {w}", file=stdout)
 
     initial = chem_smiles.embed_3d(canonical)
-    method, basis = "b3lyp", "6-31g*"
+    method, basis = "b3lyp", "6-31g**"
 
     wf_id = db.insert_workflow(conn, "lambda_h", canonical, _now())
     print(f"workflow: id={wf_id} kind=lambda_h smiles={canonical}", file=stdout)
