@@ -42,17 +42,35 @@ class Settings:
 _ENV_PREFIX = "OSC_"
 
 
+def _load_toml() -> dict:
+    """Return dict from config.local.toml or config.toml in CWD, or {} if neither exists."""
+    import tomllib
+    from pathlib import Path
+
+    for name in ("config.local.toml", "config.toml"):
+        p = Path(name)
+        if p.exists():
+            with p.open("rb") as f:
+                return tomllib.load(f)
+    return {}
+
+
 def load(**overrides) -> Settings:
     """Load Settings from environment + kwargs.
 
-    Precedence: kwargs > OSC_<FIELD> env vars > dataclass defaults.
-    Unknown kwargs raise TypeError (via Settings constructor). Env values are
-    coerced to int for numeric fields; everything else is read as a string.
+    Precedence: kwargs > OSC_<FIELD> env vars > config.local.toml / config.toml > defaults.
+    Unknown kwargs raise TypeError (via Settings constructor). Env values and TOML
+    values are coerced to int for numeric fields; everything else is read as a string.
     """
     import os
     from dataclasses import fields
 
+    toml_data = _load_toml()
     kwargs: dict = {}
+    for f in fields(Settings):
+        if f.name in toml_data:
+            val = toml_data[f.name]
+            kwargs[f.name] = int(val) if (f.type is int or f.type == "int") else str(val)
     for f in fields(Settings):
         env_key = _ENV_PREFIX + f.name.upper()
         if env_key in os.environ:

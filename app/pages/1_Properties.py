@@ -116,10 +116,17 @@ if btn_col.button("↺ Refresh"):
 
 conn = _open_db()
 try:
+    # Exclude λ_h workflow sub-jobs: neutral_opt / cation_opt carry
+    # job_kind='properties' but are workflow internals (cation_opt would show its
+    # +1 alpha orbitals under HOMO/LUMO with no charge cue). Batch jobs also carry
+    # a workflow_id but are genuine standalone requests, so filter on kind only.
     prop_rows = conn.execute(
         "SELECT id, smiles, method, basis, status, submitted_at, "
         "homo_ev, lumo_ev, gap_ev, dipole_debye "
-        "FROM v_jobs_with_results WHERE job_kind = 'properties' ORDER BY id DESC"
+        "FROM v_jobs_with_results WHERE job_kind = 'properties' "
+        "AND (workflow_id IS NULL OR workflow_id NOT IN "
+        "(SELECT id FROM workflows WHERE kind = 'lambda_h')) "
+        "ORDER BY id DESC"
     ).fetchall()
     tddft_rows = conn.execute(
         "SELECT j.id, j.smiles, j.status, r.spectra_json "

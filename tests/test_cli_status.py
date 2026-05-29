@@ -59,3 +59,20 @@ def test_status_lists_jobs(tmp_path, capsys):
     # HOMO column populated for the complete row, dashes for the running one.
     assert "-6.700" in out
     assert "—" in out
+
+
+def test_status_shows_charge_column(tmp_path, capsys):
+    """status shows each job's charge so a charged sub-job's orbitals (e.g. a λ_h
+    cation_opt) are not misread as neutral properties."""
+    s = _settings(tmp_path)
+    conn = db.open(s.db_path)
+    jid = db.insert_job(conn, _job(signature="cat", charge=1, mult=2, status="complete"))
+    db.insert_result(conn, db.Result(job_id=jid, homo_ev=-9.9, lumo_ev=-5.0, gap_ev=4.9))
+
+    run_status(argparse.Namespace(), s, conn)
+    out = capsys.readouterr().out
+    assert "chg" in out  # charge column header present
+    data = next(ln for ln in out.splitlines() if "c1ccccc1" in ln)
+    fields = data.split()  # id  status  method/basis  chg  HOMO  gap  smiles
+    assert fields[3] == "1"
+    assert fields[4] == "-9.900"

@@ -95,6 +95,7 @@ class SshBackend:
             nproc=self.s.gaussian_nproc,
             pe=self.s.remote_pe,
             exe=self.s.gaussian_exe,
+            scratch_dir=self.s.scratch_dir,
         )
         # paramiko exec for the heredoc-free write: use a sftp file handle.
         with self._sftp.open(remote_script, "w") as f:
@@ -196,16 +197,20 @@ def _ensure_remote_dir(sftp, remote_dir: str) -> None:
             sftp.mkdir(path)
 
 
-def _qsub_script(*, remote_dir: str, label: str, nproc: int, pe: str, exe: str) -> str:
+def _qsub_script(
+    *, remote_dir: str, label: str, nproc: int, pe: str, exe: str, scratch_dir: str = ""
+) -> str:
     pe_line = f"#$ -pe {pe} {nproc}\n" if nproc > 1 else ""
+    job_name = label[:64]  # UGE job name (max ~64 chars)
+    scrdir_line = f"export GAUSS_SCRDIR={scratch_dir}\n" if scratch_dir else ""
     return (
         "#!/bin/sh\n"
         "#$ -S /bin/sh\n"
-        "#$ -V\n" + pe_line + "#$ -q all.q\n"
+        "#$ -V\n"
+        f"#$ -N {job_name}\n" + pe_line + "#$ -q all.q\n"
         "#$ -cwd\n"
         "#$ -j y\n"
-        f"cd {remote_dir}\n"
-        f"{exe} < {label}.com > {label}.log\n"
+        f"cd {remote_dir}\n" + scrdir_line + f"{exe} {label}.com {label}.log\n"
     )
 
 

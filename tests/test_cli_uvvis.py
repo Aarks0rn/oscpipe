@@ -122,13 +122,13 @@ def test_uvvis_from_log_validator_rejects_atom_mismatch(tmp_path):
 
     import oscpipe.cli.main as cli_main
 
-    real_reader = cli_main._ase_read_gaussian
-    cli_main._ase_read_gaussian = fake_reader
+    real_reader = cli_main.read_gaussian_log
+    cli_main.read_gaussian_log = fake_reader
     try:
         with pytest.raises(ValueError, match="atom multiset mismatch"):
             _atoms_from_log_validated(str(fake_log), "c1ccccc1")  # benzene: 6 C, 6 H
     finally:
-        cli_main._ase_read_gaussian = real_reader
+        cli_main.read_gaussian_log = real_reader
 
 
 def test_uvvis_from_log_validator_accepts_matching_atoms(tmp_path):
@@ -145,14 +145,14 @@ def test_uvvis_from_log_validator_accepts_matching_atoms(tmp_path):
 
     import oscpipe.cli.main as cli_main
 
-    real_reader = cli_main._ase_read_gaussian
-    cli_main._ase_read_gaussian = fake_reader
+    real_reader = cli_main.read_gaussian_log
+    cli_main.read_gaussian_log = fake_reader
     try:
         atoms = _atoms_from_log_validated(str(fake_log), "c1ccccc1")
         assert atoms is not None
         assert len(atoms.get_chemical_symbols()) > 0
     finally:
-        cli_main._ase_read_gaussian = real_reader
+        cli_main.read_gaussian_log = real_reader
 
 
 def test_uvvis_from_log_missing_file_raises(tmp_path):

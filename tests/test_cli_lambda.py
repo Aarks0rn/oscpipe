@@ -5,8 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 
+import ase
+import numpy as np
+
 from _helpers import StubBackend, synth_log
 
+from oscpipe.chem.geometry import build_pi_stack_dimer
 from oscpipe.cli.main import run_lambda
 from oscpipe.settings import Settings
 from oscpipe.store import db
@@ -117,3 +121,60 @@ def test_lambda_opt_stage_failure_marks_workflow_error(tmp_path, capsys):
     summary = json.loads(wf["summary_json"])
     assert summary["stage"] == "opt"
     assert "lambda: opt stage failed" in capsys.readouterr().out
+
+
+def test_build_pi_stack_dimer_no_clash_when_misaligned():
+    """Stacked dimer must have no clashing atoms even if the monomer is not XY-aligned."""
+    # Four coplanar C atoms in the XY plane, then rotated 60° around X.
+    # Old code: second copy at Z_original + 3.5 → overlap. New code: aligns first.
+    atoms = ase.Atoms(
+        "CCCC",
+        positions=[[0.0, 0.0, 0.0], [1.4, 0.0, 0.0], [2.8, 0.0, 0.0], [4.2, 0.0, 0.0]],
+    )
+    theta = np.radians(60)
+    Rx = np.array(
+        [[1, 0, 0], [0, np.cos(theta), -np.sin(theta)], [0, np.sin(theta), np.cos(theta)]]
+    )
+    atoms.positions = (Rx @ atoms.positions.T).T
+
+    stack_distance = 3.5
+    dimer = build_pi_stack_dimer(atoms, stack_distance=stack_distance)
+
+    n = len(atoms)
+    pos1 = dimer.positions[:n]
+    pos2 = dimer.positions[n:]
+
+    dists = np.linalg.norm(pos1[:, np.newaxis] - pos2[np.newaxis], axis=2)
+    assert dists.min() > 2.5, f"atoms too close: {dists.min():.2f} Å"
+    assert abs(pos2[:, 2].mean() - pos1[:, 2].mean() - stack_distance) < 0.05
+
+
+def test_build_pi_stack_dimer_no_clash_for_nonplanar_molecule():
+    """Dimer must not clash when the monomer has genuine out-of-plane atoms.
+
+    Reproduces the real failure mode for C40H18F4N4S8: ring-twisted molecules
+    have H atoms ±2.2 Å from the mean plane.  Old code (simple Z shift) puts
+    the upper H of monomer1 at +2.2 Å and the lower H of monomer2 at 3.5-2.2=1.3 Å
+    — only 0.9 Å apart.  New code must slip-stack until gap >= 2.5 Å.
+    """
+    # Four aromatic-core atoms near-planar, plus one atom far above and one far below.
+    # This is the smallest geometry that reproduces the ±2.2 Å Z-extent of the real molecule.
+    positions = [
+        [0.0, 0.0, 0.0],
+        [1.4, 0.0, 0.0],
+        [0.0, 1.4, 0.0],
+        [1.4, 1.4, 0.0],
+        [0.7, 0.7, 2.2],  # far-above atom (H-like)
+        [0.7, 0.7, -2.2],  # far-below atom (H-like)
+    ]
+    atoms = ase.Atoms("CCCCCC", positions=positions)
+
+    stack_distance = 3.5
+    dimer = build_pi_stack_dimer(atoms, stack_distance=stack_distance)
+
+    n = len(atoms)
+    pos1 = dimer.positions[:n]
+    pos2 = dimer.positions[n:]
+
+    dists = np.linalg.norm(pos1[:, np.newaxis] - pos2[np.newaxis], axis=2)
+    assert dists.min() > 2.5, f"atoms too close: {dists.min():.2f} Å"
