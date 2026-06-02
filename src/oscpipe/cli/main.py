@@ -31,6 +31,7 @@ from ..settings import Settings, load
 from ..store import db
 from ..store.cache import signature
 from ..workflows.lambda_h import run_lambda_h
+from ..workflows.oligomer_sweep import run_oligomer_sweep
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -69,6 +70,11 @@ def build_parser() -> argparse.ArgumentParser:
             "element multiset must match the SMILES."
         ),
     )
+
+    og = sub.add_parser("oligomer", help="oligomer-length sweep + 1/n extrapolation")
+    og.add_argument("repeat_unit", help="repeat-unit SMILES with two [*] attachment points")
+    og.add_argument("--max-n", dest="max_n", type=int, default=3)
+    og.add_argument("--nstates", type=int, default=10)
 
     sub.add_parser("status", help="print job table")
     sub.add_parser("preflight", help="workstation health check")
@@ -288,6 +294,21 @@ def run_lambda(
 ) -> int:
     """λ_h workflow — thin adapter over oscpipe.workflows.lambda_h.run_lambda_h."""
     return run_lambda_h(
+        args, settings, backend, conn, stdout=stdout, geometry_loader=geometry_loader
+    )
+
+
+def run_oligomer(
+    args,
+    settings: Settings,
+    backend,
+    conn,
+    *,
+    stdout=None,
+    geometry_loader=None,
+) -> int:
+    """Oligomer sweep — thin adapter over oscpipe.workflows.oligomer_sweep.run_oligomer_sweep."""
+    return run_oligomer_sweep(
         args, settings, backend, conn, stdout=stdout, geometry_loader=geometry_loader
     )
 
@@ -548,6 +569,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_uvvis(args, settings, _make_backend(settings), conn)
         if args.cmd == "lambda":
             return run_lambda(args, settings, _make_backend(settings), conn)
+        if args.cmd == "oligomer":
+            return run_oligomer(args, settings, _make_backend(settings), conn)
         raise NotImplementedError(f"cmd={args.cmd} not yet wired up")
     finally:
         conn.close()
