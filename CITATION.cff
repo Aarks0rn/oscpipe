@@ -1,0 +1,20 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: oscpipe
+abstract: >-
+  An end-to-end DFT pipeline for organic-semiconductor (OSC) molecules: from a
+  SMILES string to an optimized geometry and electronic properties, dispatching
+  Gaussian 16 jobs to a remote HPC cluster over SSH.
+type: software
+authors:
+  - name: "Aarks0rn"
+version: "0.1.0"
+date-released: "2026-06-03"
+license: MIT
+repository-code: "https://github.com/Aarks0rn/oscpipe"
+keywords:
+  - density functional theory
+  - organic semiconductors
+  - Gaussian 16
+  - computational chemistry
+  - cheminformatics
