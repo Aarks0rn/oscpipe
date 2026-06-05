@@ -1,5 +1,7 @@
 # oscpipe
 
+[![DOI](https://zenodo.org/badge/1246342088.svg)](https://zenodo.org/badge/latestdoi/1246342088) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 An end-to-end DFT pipeline for organic-semiconductor (OSC) molecules: from a SMILES
 string to an optimized geometry and electronic properties, with the heavy Gaussian 16
 jobs dispatched to a remote HPC cluster over SSH. Ships a CLI and a Streamlit dashboard,
