@@ -4,7 +4,7 @@ import streamlit as st
 
 st.set_page_config(page_title="oscpipe", layout="wide")
 st.title("oscpipe — OSC DFT pipeline")
-st.caption("Smart Ring Prototype workflow")
+st.caption("SMILES → Gaussian 16 → properties")
 
 st.markdown(
     """

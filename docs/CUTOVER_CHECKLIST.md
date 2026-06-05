@@ -38,4 +38,4 @@ All five workflows must pass before archiving the old repo. Tick each box only w
 
 ## Scope-creep gate
 
-Any feature outside the four Smart Ring workflows (Properties, Marcus/Indo, UV-Vis, Workstation) requires an ADR in `docs/adr/` before implementation. No exceptions for "just one more tab".
+Any feature outside the four core workflows (Properties, Marcus/Indo, UV-Vis, Workstation) requires an ADR in `docs/adr/` before implementation. No exceptions for "just one more tab".

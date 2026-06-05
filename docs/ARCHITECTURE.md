@@ -1,6 +1,6 @@
 # oscpipe — Architecture
 
-Single-purpose pipeline for the Smart Ring Prototype. Replaces OSC-pipeline/.
+An OSC DFT pipeline: SMILES → Gaussian 16 → electronic properties, with the heavy jobs dispatched to a remote HPC over SSH.
 
 ## Layers
 
@@ -35,15 +35,14 @@ mirrors this layer).
 
 ## Scope
 
-Smart Ring Prototype workflows only:
+Core workflows:
 
 1. Properties (HOMO / LUMO / gap / dipole)
 2. λ_reorg (4-point Nelsen) + Marcus rate
 3. Transfer integral (ZINDO dimer)
 4. UV-Vis TDDFT
 
-Out of scope: herringbone, NICS, oligomer scan. Refer to the OSC-pipeline-v3-archive
-if any of those become relevant for the Smart Ring path.
+Out of scope: herringbone, NICS.
 
 ## Job model
 

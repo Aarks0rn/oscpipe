@@ -1,3 +1,3 @@
-"""oscpipe — OSC DFT pipeline for the Smart Ring Prototype."""
+"""oscpipe — an OSC DFT pipeline: SMILES → Gaussian 16 → properties."""
 
 __version__ = "0.1.0"

@@ -1,7 +1,7 @@
 [project]
 name = "oscpipe"
 version = "0.1.0"
-description = "OSC DFT pipeline for the Smart Ring Prototype — SMILES → Gaussian → properties."
+description = "OSC DFT pipeline: SMILES → Gaussian 16 → properties, with SSH dispatch to a remote HPC."
 requires-python = ">=3.11"
 dependencies = [
     "ase>=3.28",
