@@ -35,3 +35,14 @@ def test_xyz_to_atoms_parses_with_comment():
     atoms = xyz_to_atoms(xyz)
     assert atoms.get_chemical_symbols() == ["H", "H"]
     np.testing.assert_allclose(atoms.get_positions()[1], [0.0, 0.0, 0.74], atol=1e-6)
+
+
+def test_geometry_hash_stable_and_distinct():
+    from oscpipe.chem.geometry import geometry_hash
+
+    a = ase.Atoms(symbols=["C", "H"], positions=[[0, 0, 0], [1.1, 0, 0]])
+    b = ase.Atoms(symbols=["C", "H"], positions=[[0, 0, 0], [1.1, 0, 0]])
+    c = ase.Atoms(symbols=["C", "H"], positions=[[0, 0, 0], [1.4, 0, 0]])
+    assert geometry_hash(a) == geometry_hash(b)
+    assert geometry_hash(a) != geometry_hash(c)
+    assert len(geometry_hash(a)) == 8

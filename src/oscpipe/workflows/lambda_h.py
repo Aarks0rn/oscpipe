@@ -19,7 +19,7 @@ from ..analysis.marcus import lambda_hole_from_4_points, marcus_rate
 from ..chem import smiles as chem_smiles
 from ..chem.geometry import build_pi_stack_dimer, read_gaussian_log
 from ..dft import gaussian
-from ..run import JobRunner, _now
+from ..run import JobRunner, JobSpec, _now
 from ..run import label as _label
 from ..settings import Settings
 from ..store import db
@@ -62,7 +62,7 @@ def run_lambda_h(
 
     runner = JobRunner(conn, settings, backend, stdout)
 
-    def _opt_job(charge, mult, suffix):
+    def _opt_spec(charge, mult, suffix):
         sig = signature(canonical, method, basis, charge, mult)
         label = f"{_label(canonical, sig)}_{suffix}"
 
@@ -94,11 +94,14 @@ def run_lambda_h(
             notes=suffix,
         )
         # need_log: the optimised geometry is read back from the log for the SPs.
-        return runner.resolve(job, label, _build, wait=True, need_log=True)
+        return JobSpec(job=job, label=label, build_com=_build, need_log=True)
 
-    # 1+2: optimise neutral and cation.
-    neutral = _opt_job(0, 1, "neutral_opt")
-    cation = _opt_job(1, 2, "cation_opt")
+    # 1+2: optimise neutral and cation. They are independent and are the cost
+    # bottleneck of the whole workflow, so run them in parallel (≤ max_lanes).
+    neutral, cation = runner.resolve_concurrent(
+        [_opt_spec(0, 1, "neutral_opt"), _opt_spec(1, 2, "cation_opt")],
+        max_lanes=settings.max_lanes,
+    )
     if neutral.status != "complete" or cation.status != "complete":
         db.update_workflow(
             conn,
@@ -115,8 +118,10 @@ def run_lambda_h(
     neutral_geom = geometry_loader(neutral.log_path)
     cation_geom = geometry_loader(cation.log_path)
 
-    # 3+4: single points at the *other* geometry.
-    def _sp_job(atoms, charge, mult, kind, suffix):
+    # 3+4+5: the two cross single points and the π-stacked dimer SP all depend
+    # only on the Layer-1 geometries and are independent of each other, so build
+    # all three specs and run them in one parallel layer (≤ max_lanes).
+    def _sp_spec(atoms, charge, mult, kind, suffix):
         sig = signature(canonical, method, basis, charge, mult, extras=suffix)
         label = f"{_label(canonical, sig)}_{suffix}"
 
@@ -148,44 +153,15 @@ def run_lambda_h(
             notes=suffix,
         )
         # The SP contributes only its energy (read from the result), not geometry.
-        return runner.resolve(job, label, _build, wait=True)
+        return JobSpec(job=job, label=label, build_com=_build, need_log=False)
 
-    n_at_c = _sp_job(cation_geom, 0, 1, "sp_neutral", "neutral_at_cation_geom")
-    c_at_n = _sp_job(neutral_geom, 1, 2, "sp_cation", "cation_at_neutral_geom")
-    if n_at_c.status != "complete" or c_at_n.status != "complete":
-        db.update_workflow(
-            conn,
-            wf_id,
-            "error",
-            summary_json=json.dumps(
-                {"stage": "sp", "n_at_c": n_at_c.status, "c_at_n": c_at_n.status}
-            ),
-        )
-        print("lambda: sp stage failed", file=stdout)
-        return 1
-
-    e_neut_at_cat = n_at_c.result.energy_ev
-    e_cat_at_neut = c_at_n.result.energy_ev
-
-    # 4-point Nelsen scheme (energies already in eV). E_n_c is the cation-charge
-    # SP at the neutral geometry; E_c_n is the neutral-charge SP at the cation
-    # geometry — see analysis.marcus for the mapping.
-    lambda_h = lambda_hole_from_4_points(
-        e_n_n=e_neut_opt,
-        e_n_c=e_cat_at_neut,
-        e_c_c=e_cat_opt,
-        e_c_n=e_neut_at_cat,
-    )
-    print(f"lambda_h = {lambda_h:.4f} eV", file=stdout)
-
-    # ── job 5: dimer SP → J_hole → Marcus rate ──────────────────────────────
-    # The dimer SP uses ωB97X-D, not the B3LYP used for the λ_h jobs above. J_hole
-    # is the HOMO/HOMO-1 eigenvalue splitting at a fixed geometry, so the functional
-    # is the only lever on its accuracy: ωB97X-D's range separation reduces the
-    # delocalization error that inflates B3LYP splittings. (A B3LYP-D3 dispersion
-    # correction would be a no-op here — D3 is a post-SCF additive term that never
-    # enters the Kohn-Sham matrix, so it leaves the eigenvalues unchanged.) See
-    # docs/adr/0002-dimer-functional.md for the mixed-functional rationale.
+    # job 5: dimer SP → J_hole. Uses ωB97X-D, not the B3LYP used for the λ_h jobs
+    # above. J_hole is the HOMO/HOMO-1 eigenvalue splitting at a fixed geometry, so
+    # the functional is the only lever on its accuracy: ωB97X-D's range separation
+    # reduces the delocalization error that inflates B3LYP splittings. (A B3LYP-D3
+    # dispersion correction would be a no-op here — D3 is a post-SCF additive term
+    # that never enters the Kohn-Sham matrix, so it leaves the eigenvalues
+    # unchanged.) See docs/adr/0002-dimer-functional.md for the mixed-functional rationale.
     dimer_method = "wb97xd"
     dimer_atoms = build_pi_stack_dimer(neutral_geom)
     sig_dimer = signature(canonical, dimer_method, basis, 0, 1, extras="dimer_sp")
@@ -218,8 +194,41 @@ def run_lambda_h(
         workflow_id=wf_id,
         notes="dimer_sp",
     )
-    # need_log: J_hole is read from the dimer log by analysis.indo.transfer_integral.
-    dimer = runner.resolve(job_dimer, label_dimer, _build_dimer, wait=True, need_log=True)
+
+    # need_log on the dimer: J_hole is read from its log by analysis.indo.transfer_integral.
+    n_at_c, c_at_n, dimer = runner.resolve_concurrent(
+        [
+            _sp_spec(cation_geom, 0, 1, "sp_neutral", "neutral_at_cation_geom"),
+            _sp_spec(neutral_geom, 1, 2, "sp_cation", "cation_at_neutral_geom"),
+            JobSpec(job=job_dimer, label=label_dimer, build_com=_build_dimer, need_log=True),
+        ],
+        max_lanes=settings.max_lanes,
+    )
+    if n_at_c.status != "complete" or c_at_n.status != "complete":
+        db.update_workflow(
+            conn,
+            wf_id,
+            "error",
+            summary_json=json.dumps(
+                {"stage": "sp", "n_at_c": n_at_c.status, "c_at_n": c_at_n.status}
+            ),
+        )
+        print("lambda: sp stage failed", file=stdout)
+        return 1
+
+    e_neut_at_cat = n_at_c.result.energy_ev
+    e_cat_at_neut = c_at_n.result.energy_ev
+
+    # 4-point Nelsen scheme (energies already in eV). E_n_c is the cation-charge
+    # SP at the neutral geometry; E_c_n is the neutral-charge SP at the cation
+    # geometry — see analysis.marcus for the mapping.
+    lambda_h = lambda_hole_from_4_points(
+        e_n_n=e_neut_opt,
+        e_n_c=e_cat_at_neut,
+        e_c_c=e_cat_opt,
+        e_c_n=e_neut_at_cat,
+    )
+    print(f"lambda_h = {lambda_h:.4f} eV", file=stdout)
 
     j_hole_ev: float | None = None
     marcus: float | None = None

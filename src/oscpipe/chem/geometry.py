@@ -16,6 +16,18 @@ def atoms_to_xyz(atoms) -> str:
     return "\n".join(lines) + "\n"
 
 
+def geometry_hash(atoms) -> str:
+    """Short stable hash (8 hex chars) of an ASE Atoms geometry.
+
+    Used to discriminate cache signatures when a job's geometry comes from a
+    file (--from-log) instead of a fresh RDKit embed: same SMILES, different
+    geometry, must not share a cache entry.
+    """
+    import hashlib
+
+    return hashlib.sha1(atoms_to_xyz(atoms).encode()).hexdigest()[:8]
+
+
 def xyz_to_atoms(xyz: str):
     """Parse XYZ-format string into an ASE Atoms object."""
     import ase

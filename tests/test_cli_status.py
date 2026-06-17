@@ -76,3 +76,50 @@ def test_status_shows_charge_column(tmp_path, capsys):
     fields = data.split()  # id  status  method/basis  chg  HOMO  gap  smiles
     assert fields[3] == "1"
     assert fields[4] == "-9.900"
+
+
+class _StatusBackend:
+    """Minimal backend for the liveness column: poll returns a fixed PID state."""
+
+    def __init__(self, status="running"):
+        self._status = status
+        self._jobs: dict[str, str] = {}
+
+    def poll(self, sid):
+        return self._status
+
+
+def test_status_running_filter_hides_terminal(tmp_path, capsys):
+    s = _settings(tmp_path)
+    conn = db.open(s.db_path)
+    db.insert_job(conn, _job(signature="done", smiles="c1ccccc1", status="complete"))
+    db.insert_job(conn, _job(signature="run", smiles="c1ccsc1", status="running", ssh_jobid="111"))
+    db.insert_job(conn, _job(signature="pend", smiles="c1ccoc1", status="pending"))
+
+    run_status(argparse.Namespace(running=True), s, conn)
+    out = capsys.readouterr().out
+    assert "c1ccsc1" in out and "c1ccoc1" in out  # running + pending shown
+    assert "c1ccccc1" not in out  # complete hidden
+
+
+def test_status_liveness_column_only_with_backend(tmp_path, capsys):
+    s = _settings(tmp_path)
+    conn = db.open(s.db_path)
+    db.insert_job(
+        conn,
+        _job(
+            signature="run",
+            smiles="c1ccsc1",
+            status="running",
+            started_at="2026-05-21T00:00:00",
+            ssh_jobid="111",
+        ),
+    )
+
+    run_status(argparse.Namespace(), s, conn)  # no backend → no live column
+    assert "live" not in capsys.readouterr().out
+
+    run_status(argparse.Namespace(), s, conn, backend=_StatusBackend(status="running"))
+    out = capsys.readouterr().out
+    assert "live" in out  # live column header present
+    assert "ALIVE" in out  # polled PID state rendered

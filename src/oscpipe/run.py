@@ -24,6 +24,7 @@ from typing import IO, NamedTuple
 from .dft import gaussian
 from .settings import Settings
 from .store import db
+from .store.cache import signature
 
 
 def _now() -> str:
@@ -52,6 +53,46 @@ def label_for_row(row) -> str:
     return base
 
 
+def make_job(
+    canonical: str,
+    method: str,
+    basis: str,
+    charge: int,
+    mult: int,
+    job_kind: str,
+    *,
+    extras: str = "",
+    workflow_id: int | None = None,
+    notes: str | None = None,
+) -> tuple[db.Job, str]:
+    """Signature + remote label + pending Job row in one step.
+
+    The single home for the canonical-SMILES → signature → label convention
+    used by the single-shot commands (submit, uvvis) and the screen workflow.
+
+    λ_h / oligomer-sweep sub-jobs must NOT use this helper: their signature
+    job_kind deliberately differs from the row's job_kind and their labels
+    carry suffixes (see ADR 0003) — routing them through here would silently
+    change their signatures and orphan the live cache.
+    """
+    sig = signature(canonical, method, basis, charge, mult, job_kind=job_kind, extras=extras)
+    job = db.Job(
+        id=None,
+        signature=sig,
+        smiles=canonical,
+        method=method,
+        basis=basis,
+        charge=charge,
+        mult=mult,
+        job_kind=job_kind,
+        status="pending",
+        submitted_at=_now(),
+        workflow_id=workflow_id,
+        notes=notes,
+    )
+    return job, label(canonical, sig)
+
+
 def db_dir(settings: Settings) -> Path:
     return Path(settings.db_path).resolve().parent
 
@@ -60,6 +101,18 @@ def log_dir(settings: Settings) -> Path:
     d = db_dir(settings) / "logs"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def _preopt_steps_exceeded(local_log: str) -> bool:
+    """True if a g16 log Error-terminated only because the optimiser hit its step
+    cap ('Number of steps exceeded'). That is recoverable for a PM6 pre-opt — the
+    last geometry is a usable seed — whereas SCF death or a singular B-matrix
+    ('FormBX'/'Bend failed') are not and lack this line."""
+    try:
+        with open(local_log, encoding="utf-8", errors="ignore") as f:
+            return "Number of steps exceeded" in f.read()
+    except OSError:
+        return False
 
 
 def remote_log_path(settings: Settings, label_: str) -> str:
@@ -81,6 +134,21 @@ class Resolved(NamedTuple):
     log_path: str | None
     result: object | None
     cached: bool
+
+
+@dataclass
+class JobSpec:
+    """One job to run through :meth:`JobRunner.resolve_concurrent`.
+
+    ``build_com`` is called lazily — only on a cache miss, only once a lane opens —
+    so the 3-D embed / .com write is skipped for cached jobs (same contract as the
+    ``build_com`` passed to ``resolve``).
+    """
+
+    job: db.Job
+    label: str
+    build_com: Callable[[], str]
+    need_log: bool = False
 
 
 @dataclass
@@ -132,22 +200,66 @@ class JobRunner:
         ``need_log=True`` invalidates a cache hit whose local .log is gone — the
         caller needs the geometry, so the job must be recomputed.
         """
-        hit = db.find_complete_by_signature(self.conn, job.signature)
-        if hit is not None:
-            cached = self._load_cached(hit, need_log=need_log)
-            if cached is not None:
-                return cached
-
-        job_id, ssh_jobid = self._submit(job, build_com(), label_)
+        cached = self._try_cache(job, need_log=need_log)
+        if cached is not None:
+            return cached
+        job_id, ssh_jobid = self._reattach_or_submit(job, build_com, label_)
         status = self._wait(ssh_jobid) if wait else self.backend.poll(ssh_jobid)
+        return self._finalize(job_id, job, ssh_jobid, label_, status)
 
-        if status == "detached":
+    def _try_cache(self, job: db.Job, *, need_log: bool) -> Resolved | None:
+        """Settle a job from the signature cache, or None to (re)run it.
+
+        None covers both "no completed row" and "a completed row that is unusable"
+        (missing results, or a ``need_log`` log that no longer exists) — either way
+        the caller proceeds to submit. ``build_com`` is never touched here.
+        """
+        hit = db.find_complete_by_signature(self.conn, job.signature)
+        if hit is None:
+            return None
+        return self._load_cached(hit, need_log=need_log)
+
+    def _detach(self, job_id: int | None) -> Resolved:
+        """Detached: job keeps running remotely, reattaches by signature next run.
+        Print the fetch hint when there's a job id (a queued, never-submitted job has none)."""
+        if job_id is not None:
             print(
                 f"detached: job={job_id} still running — run `oscpipe fetch` to pull results",
                 file=self.stdout,
             )
-            return Resolved(job_id, status, None, None, False)
+        return Resolved(job_id, "detached", None, None, False)
+
+    def _finalize(
+        self, job_id: int, job: db.Job, ssh_jobid: str, label_: str, status: str
+    ) -> Resolved:
+        """Turn a terminal status into a Resolved (fetch + persist on complete).
+
+        The shared tail of single-job ``resolve`` and the concurrent
+        ``resolve_concurrent`` driver, so detached / preopt-recovery / error /
+        complete handling lives in exactly one place.
+        """
+        if status == "detached":
+            return self._detach(job_id)
         if status != "complete":
+            # A PM6 pre-opt is a geometry SEED, not a stationary point. Floppy
+            # oligomers oscillate just above even the loose target and g16
+            # Error-terminates with 'Number of steps exceeded' (l9999) — but the
+            # last geometry is a perfectly good seed for the B3LYP refine. Chasing
+            # the threshold is a losing game (every larger n re-oscillates), so for
+            # preopt we accept that specific recoverable termination and persist the
+            # geometry. Real failures (SCF death, FormBX-singular) lack the
+            # 'steps exceeded' line and still fall through to error.
+            if status == "error" and job.job_kind == "preopt":
+                local_log = self.backend.fetch_log(
+                    ssh_jobid, label_, str(log_dir(self.settings))
+                )
+                if _preopt_steps_exceeded(local_log):
+                    final, result = self._persist_by_kind(job_id, job.job_kind, local_log)
+                    print(
+                        "  (pre-opt n-step cap reached — last geometry accepted as seed)",
+                        file=self.stdout,
+                    )
+                    return Resolved(job_id, final, local_log, result, False)
             if status == "error":
                 db.update_job_status(
                     self.conn,
@@ -162,6 +274,85 @@ class JobRunner:
         local_log = self.backend.fetch_log(ssh_jobid, label_, str(log_dir(self.settings)))
         final, result = self._persist_by_kind(job_id, job.job_kind, local_log)
         return Resolved(job_id, final, local_log, result, False)
+
+    def resolve_concurrent(self, specs: list[JobSpec], *, max_lanes: int) -> list[Resolved]:
+        """Resolve a set of independent jobs with at most ``max_lanes`` in flight.
+
+        The parallelism is the *remote* g16 processes; this driver is single
+        threaded and round-robin polls the active set, so it shares the one DB
+        connection with no cross-thread hazard. Cache hits are settled first with
+        no backend call. Results come back in ``specs`` order.
+
+        ``Ctrl-C`` detaches the **whole** active set — every in-flight job keeps
+        running on the workstation and reattaches by signature on the next run
+        (matches single-job ``_wait``; preserves ADR 0005 orphan prevention).
+        """
+        results: list[Resolved | None] = [None] * len(specs)
+        queue: list[int] = []
+        for i, spec in enumerate(specs):
+            cached = self._try_cache(spec.job, need_log=spec.need_log)
+            if cached is not None:
+                results[i] = cached
+            else:
+                queue.append(i)
+
+        lanes = max(1, max_lanes)
+        active: dict[str, tuple[int, JobSpec, int]] = {}
+        try:
+            while queue or active:
+                while queue and len(active) < lanes:
+                    idx = queue.pop(0)
+                    spec = specs[idx]
+                    job_id, ssh_jobid = self._reattach_or_submit(
+                        spec.job, spec.build_com, spec.label
+                    )
+                    active[ssh_jobid] = (idx, spec, job_id)
+                done: list[str] = []
+                for ssh_jobid, (idx, spec, job_id) in active.items():
+                    status = self.backend.poll(ssh_jobid)
+                    if status in ("complete", "error", "unknown"):
+                        results[idx] = self._finalize(
+                            job_id, spec.job, ssh_jobid, spec.label, status
+                        )
+                        done.append(ssh_jobid)
+                for ssh_jobid in done:
+                    del active[ssh_jobid]
+                if active and not done:
+                    time.sleep(self.settings.poll_interval_seconds)
+        except KeyboardInterrupt:
+            for idx, _spec, job_id in active.values():
+                results[idx] = self._detach(job_id)
+            for i, r in enumerate(results):
+                if r is None:
+                    results[i] = self._detach(None)
+        return results  # type: ignore[return-value]
+
+    def _reattach_or_submit(
+        self, job: db.Job, build_com: Callable[[], str], label_: str
+    ) -> tuple[int, str]:
+        """Reattach to an already-queued job with this signature, else submit.
+
+        Orphan prevention: if a prior run detached (Ctrl-C / disconnect) it left
+        a 'running' row + a live remote job. Re-running would otherwise submit a
+        duplicate (the cache only matches 'complete'), orphaning the first job.
+        Instead we poll the existing job. ``build_com`` is never called on the
+        reattach path, so the embed/.com write is skipped.
+        """
+        inflight = db.find_inflight_by_signature(self.conn, job.signature)
+        if inflight is not None and inflight["ssh_jobid"]:
+            job_id, ssh_jobid = inflight["id"], inflight["ssh_jobid"]
+            # This process didn't submit the job, so the backend's jobid → log
+            # map is empty; register the remote log so poll/fetch can find it.
+            if hasattr(self.backend, "_jobs"):
+                self.backend._jobs[ssh_jobid] = remote_log_path(
+                    self.settings, label_for_row(inflight)
+                )
+            print(
+                f"reattach: job={job_id} jobid={ssh_jobid} already queued — not resubmitting",
+                file=self.stdout,
+            )
+            return job_id, ssh_jobid
+        return self._submit(job, build_com(), label_)
 
     def _load_cached(self, hit, *, need_log: bool) -> Resolved | None:
         """Rebuild a :class:`Resolved` from a cache-hit row, or None if unusable.
@@ -181,7 +372,9 @@ class JobRunner:
             if not spec or not spec["spectra_json"]:
                 return None
             return Resolved(hit["id"], "complete", log_path, None, True)
-        if kind == "sp_dimer":
+        if kind in ("sp_dimer", "preopt"):
+            # Geometry-only kinds carry no results row; need_log above already
+            # guaranteed the .log is present for the downstream geometry read.
             return Resolved(hit["id"], "complete", log_path, None, True)
         # properties / sp_neutral / sp_cation — require a real results row. A
         # pre-refactor λ_h sub-job reached 'complete' with no row (all fields
@@ -232,6 +425,7 @@ class JobRunner:
             "sp_cation": self._persist_properties,
             "tddft": self._persist_tddft,
             "sp_dimer": self._persist_dimer,
+            "preopt": self._persist_geometry_only,
         }
         persist = persisters.get(job_kind)
         if persist is None:
@@ -249,6 +443,14 @@ class JobRunner:
             )
             print(f"job {job_id} complete but parse failed: {exc}", file=self.stdout)
             return "error", None
+
+    def _persist_geometry_only(self, job_id: int, local_log: str) -> tuple[str, None]:
+        """Persist a geometry-only job (PM6 pre-opt). No properties are parsed —
+        the workflow reads the optimised geometry straight from the .log via the
+        geometry loader. Just mark it complete and record the log path."""
+        db.update_job_status(self.conn, job_id, "complete", completed_at=_now(), log_path=local_log)
+        print(f"complete: job={job_id} (geometry-only pre-opt)", file=self.stdout)
+        return "complete", None
 
     def _persist_properties(self, job_id: int, local_log: str) -> tuple[str, object]:
         props = gaussian.parse_properties(local_log)

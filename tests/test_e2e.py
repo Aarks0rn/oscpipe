@@ -1,7 +1,7 @@
 """End-to-end smoke: SMILES → backend → DB row.
 
 All tests use StubBackend so the suite runs offline.
-Real workstation tests (SshBackend + qsub) live in test_real_workstation.py.
+Real workstation tests (SshBackend) live in test_real_workstation.py.
 """
 
 from __future__ import annotations

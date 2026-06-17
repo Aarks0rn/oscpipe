@@ -5,10 +5,13 @@ Subcommands:
                 polls once before exit so the LocalBackend's synchronous
                 runs land in the DB inline.
     batch       Submit a list of SMILES (CSV with `smiles` column, or stdin).
+    screen      Campaign: properties + uvvis + λ_h per candidate, sequential
+                and blocking; resume by re-running (signature cache).
     fetch       Poll running jobs and pull completed logs back.
     status      Print the job table.
+    export      Flat one-row-per-candidate CSV of stored results.
     reconcile   Poll backend for all pending/running jobs; mark losses.
-    preflight   Workstation health check: g16, qstat, scratch_dir, DB.
+    preflight   Workstation health check: g16, work_dir, DB.
     lambda      λ_reorg (4-point).
     uvvis       TDDFT excited states.
 """
@@ -17,21 +20,22 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import sys
+import time
 from types import SimpleNamespace
 from typing import IO
 
 from ..chem import smiles as chem_smiles
-from ..chem.geometry import read_gaussian_log
+from ..chem.geometry import geometry_hash, read_gaussian_log
 from ..dft import gaussian
-from ..run import JobRunner, _now
+from ..run import JobRunner, _now, make_job
 from ..run import db_dir as _db_dir
-from ..run import label as _label
 from ..settings import Settings, load
 from ..store import db
-from ..store.cache import signature
 from ..workflows.lambda_h import run_lambda_h
 from ..workflows.oligomer_sweep import run_oligomer_sweep
+from ..workflows.screen import run_screen as run_screen_workflow
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,8 +56,17 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--charge", type=int, default=0)
     b.add_argument("--mult", type=int, default=1)
 
+    sc = sub.add_parser("screen", help="campaign: properties + uvvis + λ_h per candidate (blocking)")
+    sc.add_argument("file", help='CSV with a "smiles" column, or "-" for stdin')
+    sc.add_argument("--method", default="b3lyp")
+    sc.add_argument("--basis", default="6-31g**")
+    sc.add_argument("--nstates", type=int, default=10)
+
     lm = sub.add_parser("lambda", help="λ_reorg + Marcus rate (4-point)")
     lm.add_argument("smiles")
+
+    ex = sub.add_parser("export", help="flat one-row-per-candidate CSV of stored results")
+    ex.add_argument("--csv", required=True, help="output path")
 
     uv = sub.add_parser("uvvis", help="TDDFT excited states")
     uv.add_argument("smiles")
@@ -76,9 +89,17 @@ def build_parser() -> argparse.ArgumentParser:
     og.add_argument("--max-n", dest="max_n", type=int, default=3)
     og.add_argument("--nstates", type=int, default=10)
 
-    sub.add_parser("status", help="print job table")
+    st = sub.add_parser("status", help="print job table")
+    st.add_argument(
+        "--watch",
+        type=int,
+        default=0,
+        metavar="N",
+        help="refresh every N seconds (live); polls real PID liveness for running jobs",
+    )
+    st.add_argument("--running", action="store_true", help="show only pending/running jobs")
     sub.add_parser("preflight", help="workstation health check")
-    sub.add_parser("reconcile", help="sync local DB with qstat")
+    sub.add_parser("reconcile", help="sync local DB with the backend")
 
     f = sub.add_parser("fetch", help="download completed logs + parse")
     f.add_argument("--job-id", type=int)
@@ -130,8 +151,15 @@ def run_submit(args, settings: Settings, backend, conn, *, stdout=None, workflow
     for w in warnings:
         print(f"warning: {w}", file=stdout)
 
-    sig = signature(canonical, args.method, args.basis, args.charge, args.mult)
-    label = _label(canonical, sig)
+    job, label = make_job(
+        canonical,
+        args.method,
+        args.basis,
+        args.charge,
+        args.mult,
+        "properties",
+        workflow_id=workflow_id,
+    )
 
     def _build_com() -> str:
         atoms = chem_smiles.embed_3d(canonical)
@@ -147,19 +175,6 @@ def run_submit(args, settings: Settings, backend, conn, *, stdout=None, workflow
             chk=f"{label}.chk",
         )
 
-    job = db.Job(
-        id=None,
-        signature=sig,
-        smiles=canonical,
-        method=args.method,
-        basis=args.basis,
-        charge=args.charge,
-        mult=args.mult,
-        job_kind="properties",
-        status="pending",
-        submitted_at=_now(),
-        workflow_id=workflow_id,
-    )
     runner = JobRunner(conn, settings, backend, stdout)
     r = runner.resolve(job, label, _build_com, wait=False)
 
@@ -194,24 +209,29 @@ def run_uvvis(
         print(f"warning: {w}", file=stdout)
 
     method = args.method.lower()
-    sig = signature(
+    from_log = getattr(args, "from_log", None)
+    extras = f"n{args.nstates}"
+    log_atoms = None
+    if from_log:
+        # Load eagerly so the geometry reaches the signature: a --from-log run
+        # must never share a cache entry with a plain embed run of the same
+        # SMILES (same molecule, different geometry).
+        log_atoms = geometry_loader(from_log, canonical)
+        print(f"uvvis: reusing geometry from {from_log}", file=stdout)
+        extras += f"|geom{geometry_hash(log_atoms)}"
+    job, label = make_job(
         canonical,
         method,
         "6-31g**",
         0,
         1,
-        job_kind="tddft",
-        extras=f"n{args.nstates}",
+        "tddft",
+        extras=extras,
+        notes=f"nstates={args.nstates}",
     )
-    label = _label(canonical, sig)
-    from_log = getattr(args, "from_log", None)
 
     def _build_com() -> str:
-        if from_log:
-            atoms = geometry_loader(from_log, canonical)
-            print(f"uvvis: reusing geometry from {from_log}", file=stdout)
-        else:
-            atoms = chem_smiles.embed_3d(canonical)
+        atoms = log_atoms if log_atoms is not None else chem_smiles.embed_3d(canonical)
         return gaussian.write_com_tddft(
             atoms,
             method=method,
@@ -225,19 +245,6 @@ def run_uvvis(
             chk=f"{label}.chk",
         )
 
-    job = db.Job(
-        id=None,
-        signature=sig,
-        smiles=canonical,
-        method=method,
-        basis="6-31g**",
-        charge=0,
-        mult=1,
-        job_kind="tddft",
-        status="pending",
-        submitted_at=_now(),
-        notes=f"nstates={args.nstates}",
-    )
     runner = JobRunner(conn, settings, backend, stdout)
     r = runner.resolve(job, label, _build_com, wait=False)
 
@@ -407,6 +414,53 @@ def run_batch(args, settings: Settings, backend, conn, *, stdin=None, stdout=Non
     return 0 if failures == 0 else 1
 
 
+# ── screen ─────────────────────────────────────────────────────────────────
+
+
+def run_screen(args, settings: Settings, backend, conn, *, stdin=None, stdout=None) -> int:
+    """Screen campaign — thin adapter over oscpipe.workflows.screen.run_screen."""
+    if stdout is None:
+        stdout = sys.stdout
+    if stdin is None:
+        stdin = sys.stdin
+    smiles_list = _read_smiles(args.file, stdin)
+    if not smiles_list:
+        print("screen: no SMILES read", file=stdout)
+        return 1
+    return run_screen_workflow(smiles_list, args, settings, backend, conn, stdout=stdout)
+
+
+# ── export ─────────────────────────────────────────────────────────────────
+
+
+EXPORT_COLUMNS = [
+    "smiles",
+    "homo_ev",
+    "lumo_ev",
+    "gap_ev",
+    "lambda_max_nm",
+    "f_osc",
+    "lambda_h_ev",
+    "j_hole_ev",
+    "marcus_rate_s1",
+]
+
+
+def run_export(args, settings: Settings, conn, *, stdout=None) -> int:
+    """Flat one-row-per-candidate CSV of stored results (read-only, no backend)."""
+    if stdout is None:
+        stdout = sys.stdout
+    smiles_list = db.list_candidate_smiles(conn)
+    with open(args.csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS)
+        writer.writeheader()
+        for smi in smiles_list:
+            row = db.candidate_summary(conn, smi)
+            writer.writerow({k: ("" if row[k] is None else row[k]) for k in EXPORT_COLUMNS})
+    print(f"export: {len(smiles_list)} candidates -> {args.csv}", file=stdout)
+    return 0
+
+
 # ── fetch ──────────────────────────────────────────────────────────────────
 
 
@@ -462,37 +516,92 @@ def run_fetch(args, settings: Settings, backend, conn, *, stdout=None) -> int:
 # ── status ─────────────────────────────────────────────────────────────────
 
 
-def run_status(args, settings: Settings, conn, *, stdout=None) -> int:
-    if stdout is None:
-        stdout = sys.stdout
+_LIVE_LABELS = {"running": "ALIVE", "complete": "DONE", "error": "ERR", "unknown": "GONE"}
+
+
+def _elapsed(started_at) -> str:
+    """Human 'time since started_at' for the watch view; '—' if unparseable."""
+    if not started_at:
+        return "—"
+    try:
+        start = datetime.datetime.fromisoformat(started_at)
+    except ValueError:
+        return "—"
+    secs = max(0, int((datetime.datetime.now() - start).total_seconds()))
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m{s:02d}s" if m else f"{s}s"
+
+
+def _print_status_table(conn, backend, *, running_only: bool, stdout) -> None:
+    """One snapshot of the job table. With ``backend``, running rows get a live
+    column: poll the real PID (ALIVE/DONE/ERR/GONE) plus elapsed + workflow id."""
+    where = "WHERE status IN ('pending', 'running')" if running_only else ""
     rows = list(
         conn.execute(
-            "SELECT id, smiles, method, basis, charge, status, submitted_at, "
-            "homo_ev, gap_ev FROM v_jobs_with_results ORDER BY id"
+            "SELECT id, smiles, method, basis, charge, status, started_at, ssh_jobid, "
+            f"workflow_id, homo_ev, gap_ev FROM v_jobs_with_results {where} ORDER BY id"
         )
     )
     if not rows:
-        print("(no jobs)", file=stdout)
-        return 0
+        print("(no running jobs)" if running_only else "(no jobs)", file=stdout)
+        return
+    show_live = backend is not None
     # `status` is the raw job monitor (shows every job, incl. λ_h sub-jobs). The
     # charge column gives the orbital values context — a cation_opt / sp_cation row
-    # is chg=1, so its HOMO/gap is not mistaken for a neutral result. The curated
-    # view that hides sub-jobs is the Properties dashboard, not this.
-    header = (
-        f"{'id':>4}  {'status':<10}  {'method/basis':<20}  "
-        f"{'chg':>3}  {'HOMO':>8}  {'gap':>6}  smiles"
+    # is chg=1, so its HOMO/gap is not mistaken for a neutral result.
+    live_hdr = f"{'live':<5}  {'elapsed':>8}  {'wf':>4}  " if show_live else ""
+    print(
+        f"{'id':>4}  {'status':<10}  {live_hdr}{'method/basis':<20}  "
+        f"{'chg':>3}  {'HOMO':>8}  {'gap':>6}  smiles",
+        file=stdout,
     )
-    print(header, file=stdout)
     for r in rows:
         mb = f"{r['method']}/{r['basis']}"
         homo = f"{r['homo_ev']:.3f}" if r["homo_ev"] is not None else "—"
         gap = f"{r['gap_ev']:.3f}" if r["gap_ev"] is not None else "—"
+        live_cols = ""
+        if show_live:
+            live = "—"
+            if r["status"] == "running" and r["ssh_jobid"]:
+                try:
+                    live = _LIVE_LABELS.get(backend.poll(r["ssh_jobid"]), "?")
+                except Exception:
+                    live = "?"
+            wf = r["workflow_id"] if r["workflow_id"] is not None else "—"
+            live_cols = f"{live:<5}  {_elapsed(r['started_at']):>8}  {str(wf):>4}  "
         print(
-            f"{r['id']:>4}  {r['status']:<10}  {mb:<20}  "
+            f"{r['id']:>4}  {r['status']:<10}  {live_cols}{mb:<20}  "
             f"{r['charge']:>3}  {homo:>8}  {gap:>6}  {r['smiles']}",
             file=stdout,
         )
-    return 0
+
+
+def run_status(args, settings: Settings, conn, *, backend=None, stdout=None) -> int:
+    if stdout is None:
+        stdout = sys.stdout
+    running_only = getattr(args, "running", False)
+    # Live PID liveness needs the backend's jobid→log map populated for jobs this
+    # process didn't submit; rehydrate from the running rows (no-op for LocalBackend).
+    if backend is not None:
+        inflight = list(conn.execute("SELECT * FROM jobs WHERE status = 'running'"))
+        JobRunner(conn, settings, backend, stdout).rehydrate(inflight)
+
+    watch = getattr(args, "watch", 0) or 0
+    if watch <= 0:
+        _print_status_table(conn, backend, running_only=running_only, stdout=stdout)
+        return 0
+    try:
+        while True:
+            stdout.write("\x1b[2J\x1b[H")  # clear screen + cursor home
+            print(f"oscpipe status — refresh {watch}s — {_now()} (Ctrl-C to stop)", file=stdout)
+            _print_status_table(conn, backend, running_only=running_only, stdout=stdout)
+            stdout.flush()
+            time.sleep(watch)
+    except KeyboardInterrupt:
+        return 0
 
 
 # ── reconcile ──────────────────────────────────────────────────────────────
@@ -557,10 +666,22 @@ def main(argv: list[str] | None = None) -> int:
             return run_submit(args, settings, _make_backend(settings), conn)
         if args.cmd == "batch":
             return run_batch(args, settings, _make_backend(settings), conn)
+        if args.cmd == "screen":
+            return run_screen(args, settings, _make_backend(settings), conn)
         if args.cmd == "fetch":
             return run_fetch(args, settings, _make_backend(settings), conn)
         if args.cmd == "status":
-            return run_status(args, settings, conn)
+            # Live watch polls real PID liveness, so it needs a backend; a one-shot
+            # status stays DB-only (no SSH). Tolerate a misconfigured backend.
+            backend = None
+            if getattr(args, "watch", 0):
+                try:
+                    backend = _make_backend(settings)
+                except ValueError:
+                    backend = None
+            return run_status(args, settings, conn, backend=backend)
+        if args.cmd == "export":
+            return run_export(args, settings, conn)
         if args.cmd == "reconcile":
             return run_reconcile(args, settings, _make_backend(settings), conn)
         if args.cmd == "preflight":

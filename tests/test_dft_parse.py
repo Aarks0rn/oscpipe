@@ -36,7 +36,25 @@ def test_write_com_properties_has_route_line():
     assert "%nprocshared=4" in com
     assert "%mem=4GB" in com
     assert "%chk=h2_test.chk" in com
-    assert "#p b3lyp/6-31g* opt pop=full" in com.lower()
+    assert "#p b3lyp/6-31g* opt pop=full scf=(xqc,vshift=100)" in com.lower()
+
+
+def test_write_com_properties_opt_route_override():
+    # The oligomer sweep damps + loosens the opt for floppy TVT backbones (job
+    # 71248); λ_h keeps the tight default so reorganisation energy stays accurate.
+    com = gaussian.write_com_properties(
+        _h2(),
+        method="b3lyp",
+        basis="6-31g**",
+        charge=0,
+        mult=1,
+        nproc=4,
+        mem="4GB",
+        label="h2",
+        chk="h2.chk",
+        opt_route="opt=(loose,maxstep=10,maxcycles=300)",
+    )
+    assert "opt=(loose,maxstep=10,maxcycles=300) pop=full scf=(xqc,vshift=100)" in com.lower()
 
 
 def test_write_com_properties_has_charge_mult_and_coords():
@@ -54,6 +72,39 @@ def test_write_com_properties_has_charge_mult_and_coords():
 def test_write_com_properties_trailing_blank_line():
     com = gaussian.write_com_properties(_h2(), "b3lyp", "6-31g*", 0, 1, 4, "4GB", "h2", "h2.chk")
     # Gaussian requires the molecule spec to end with a blank line.
+    assert com.endswith("\n\n")
+
+
+# ── write_com_preopt ───────────────────────────────────────────────────────
+
+
+def test_write_com_preopt_route_has_no_basis():
+    # PM6 is semi-empirical: the route is `#p pm6 opt`, NOT `pm6/<basis>`.
+    com = gaussian.write_com_preopt(
+        _h2(), charge=0, mult=1, nproc=4, mem="4GB", label="h2_pre", chk="h2_pre.chk"
+    )
+    assert "#p pm6" in com.lower()
+    assert "pm6/" not in com.lower()
+    # No pop=full (geometry-only — orbitals not parsed off the pre-opt).
+    assert "pop=full" not in com.lower()
+    # n=3 near-degenerate frontier oscillates PM6's SCF too → same xqc/vshift
+    # safety as the B3LYP routes (job 71238).
+    assert "scf=(xqc,vshift=300)" in com.lower()
+    # Long oligomer passes through a near-linear angle → redundant internals go
+    # singular ('FormBX had a problem', job 71239); Cartesian opt sidesteps it.
+    # `loose` convergence: pre-opt is only a seed for the B3LYP refine, and floppy
+    # TVT backbones never hit the tight default ('Number of steps exceeded',
+    # job 71241).
+    assert "opt=(cartesian,loose,maxstep=10,maxcycles=300)" in com.lower()
+
+
+def test_write_com_preopt_has_coords_and_trailing_blank():
+    com = gaussian.write_com_preopt(
+        _h2(), charge=0, mult=1, nproc=2, mem="2GB", label="h2", chk="h2.chk"
+    )
+    lines = com.splitlines()
+    charge_idx = lines.index("0 1")
+    assert lines[charge_idx + 1].split()[0] == "H"
     assert com.endswith("\n\n")
 
 

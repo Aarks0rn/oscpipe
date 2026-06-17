@@ -11,11 +11,9 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Literal
 
 from ..dft.gaussian import is_log_complete
-
-JobStatus = Literal["pending", "running", "complete", "error", "unknown"]
+from . import JobStatus
 
 
 class LocalBackend:

@@ -48,9 +48,13 @@ def _tddft_log(s1_ev: float) -> str:
 
 
 def _sweep_log_provider(label: str) -> str:
-    m = re.search(r"n(\d+)_(opt|tddft)$", label)
+    m = re.search(r"n(\d+)_(preopt|opt|tddft)$", label)
     assert m, f"unexpected label: {label}"
     n, kind = int(m.group(1)), m.group(2)
+    if kind == "preopt":
+        # Geometry-only PM6 pre-opt: no orbitals parsed (the geometry comes from
+        # the injected geometry_loader stub). Just needs a termination marker.
+        return " ## stub PM6 pre-opt\n Normal termination of Gaussian 16 at ...\n"
     if kind == "opt":
         return _props_log(homo_ev=-4.0 - 1.0 / n)
     return _tddft_log(s1_ev=1.8 + 1.2 / n)
@@ -82,11 +86,13 @@ def test_sweep_runs_properties_and_tddft_for_each_length(tmp_path):
     assert rc == 0
 
     jobs = list(conn.execute("SELECT * FROM jobs ORDER BY id"))
-    assert len(jobs) == 6  # 3 lengths x (properties + tddft)
+    assert len(jobs) == 9  # 3 lengths x (preopt + properties + tddft)
     assert all(j["status"] == "complete" for j in jobs)
     assert len({j["workflow_id"] for j in jobs}) == 1
     kinds = sorted(j["job_kind"] for j in jobs)
-    assert kinds == ["properties", "properties", "properties", "tddft", "tddft", "tddft"]
+    assert kinds == (
+        ["preopt"] * 3 + ["properties"] * 3 + ["tddft"] * 3
+    )
 
 
 def test_sweep_extrapolates_to_polymer_limit(tmp_path):

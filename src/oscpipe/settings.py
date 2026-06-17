@@ -23,7 +23,6 @@ class Settings:
     remote_key_file: str = ""  # absolute path to SSH private key (no password mode)
     remote_work_dir: str = ""  # workstation directory for .com/.log
     known_hosts_path: str = ""  # absolute path; strict policy when set
-    remote_pe: str = "OpenMP"  # UGE parallel environment name (e.g. OpenMP, mpi)
 
     gaussian_exe: str = "g16"
     gaussian_nproc: int = 12
@@ -37,6 +36,11 @@ class Settings:
     backend: str = "ssh"  # ssh | local
     local_work_dir: str = ""  # used when backend=local
     poll_interval_seconds: int = 5
+    # Max g16 jobs run concurrently within one workflow layer. 1 = serial (every
+    # existing single-call path is unchanged). On a direct host with no queue the
+    # operator sets this; invariant: max_lanes * gaussian_nproc <= host cores and
+    # max_lanes * gaussian_mem <~ host RAM - headroom.
+    max_lanes: int = 1
 
 
 _ENV_PREFIX = "OSC_"
@@ -68,13 +72,14 @@ def load(**overrides) -> Settings:
     toml_data = _load_toml()
     kwargs: dict = {}
     for f in fields(Settings):
-        if f.name in toml_data:
-            val = toml_data[f.name]
-            kwargs[f.name] = int(val) if (f.type is int or f.type == "int") else str(val)
-    for f in fields(Settings):
-        env_key = _ENV_PREFIX + f.name.upper()
-        if env_key in os.environ:
+        # env wins over toml; both coerce to int for int fields, else str.
+        if (env_key := _ENV_PREFIX + f.name.upper()) in os.environ:
             raw = os.environ[env_key]
-            kwargs[f.name] = int(raw) if f.type is int or f.type == "int" else raw
+        elif f.name in toml_data:
+            raw = toml_data[f.name]
+        else:
+            continue
+        is_int = f.type is int or f.type == "int"
+        kwargs[f.name] = int(raw) if is_int else str(raw)
     kwargs.update(overrides)
     return Settings(**kwargs)

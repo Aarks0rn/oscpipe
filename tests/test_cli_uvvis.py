@@ -165,6 +165,80 @@ def test_uvvis_from_log_missing_file_raises(tmp_path):
         _atoms_from_log_validated(str(tmp_path / "nope.log"), "c1ccccc1")
 
 
+def _fixed_atoms(dx: float = 0.0):
+    """Deterministic tiny geometry for injected loaders (no RDKit randomness)."""
+    import ase
+
+    return ase.Atoms(symbols=["C", "H"], positions=[[0.0, 0.0, 0.0], [1.1 + dx, 0.0, 0.0]])
+
+
+def test_uvvis_from_log_does_not_hit_embed_cache(tmp_path, capsys):
+    """A planar embed run must not satisfy a later --from-log run."""
+    s, backend, conn = _setup(tmp_path)
+    run_uvvis(_args("c1ccccc1", nstates=3), s, backend, conn)
+
+    fake_log = tmp_path / "twisted_opt.log"
+    fake_log.write_text("stub")
+    capsys.readouterr()
+    rc = run_uvvis(
+        _args("c1ccccc1", nstates=3, from_log=str(fake_log)),
+        s,
+        backend,
+        conn,
+        geometry_loader=lambda _p, _c: _fixed_atoms(),
+    )
+    assert rc == 0
+    assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
+    assert "cache hit" not in capsys.readouterr().out
+
+
+def test_uvvis_embed_does_not_hit_from_log_cache(tmp_path, capsys):
+    """The reverse direction: a --from-log run must not satisfy a later embed run."""
+    s, backend, conn = _setup(tmp_path)
+    fake_log = tmp_path / "twisted_opt.log"
+    fake_log.write_text("stub")
+    run_uvvis(
+        _args("c1ccccc1", nstates=3, from_log=str(fake_log)),
+        s,
+        backend,
+        conn,
+        geometry_loader=lambda _p, _c: _fixed_atoms(),
+    )
+
+    capsys.readouterr()
+    rc = run_uvvis(_args("c1ccccc1", nstates=3), s, backend, conn)
+    assert rc == 0
+    assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 2
+    assert "cache hit" not in capsys.readouterr().out
+
+
+def test_uvvis_from_log_same_log_hits_cache(tmp_path, capsys):
+    """Two --from-log runs with the same final geometry share one cache entry."""
+    s, backend, conn = _setup(tmp_path)
+    fake_log = tmp_path / "twisted_opt.log"
+    fake_log.write_text("stub")
+    loader = lambda _p, _c: _fixed_atoms()  # noqa: E731
+
+    run_uvvis(
+        _args("c1ccccc1", nstates=3, from_log=str(fake_log)),
+        s,
+        backend,
+        conn,
+        geometry_loader=loader,
+    )
+    capsys.readouterr()
+    rc = run_uvvis(
+        _args("c1ccccc1", nstates=3, from_log=str(fake_log)),
+        s,
+        backend,
+        conn,
+        geometry_loader=loader,
+    )
+    assert rc == 0
+    assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1
+    assert "cache hit" in capsys.readouterr().out
+
+
 def test_uvvis_does_not_collide_with_properties_cache(tmp_path):
     """A pre-existing properties job must not satisfy a uvvis cache lookup."""
     s, backend, conn = _setup(tmp_path)

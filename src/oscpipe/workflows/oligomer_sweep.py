@@ -29,6 +29,7 @@ from ..settings import Settings
 from ..store import db
 from ..store.cache import signature
 
+PREOPT_METHOD = "pm6"  # cheap semi-empirical geometry seed (no basis)
 OPT_METHOD = "b3lyp"
 OPTICAL_METHOD = "wb97xd"
 BASIS = "6-31g**"
@@ -69,6 +70,43 @@ def run_oligomer_sweep(
             print(f"warning (n={n}): {w}", file=stdout)
         initial = chem_smiles.embed_3d(canonical)
 
+        # 0. PM6 pre-opt — seed a near-physical geometry. A direct B3LYP/6-31G**
+        #    opt on a large n=3 oligomer thrashes (huge steps, ~14 h/step, never
+        #    converging); pre-optimising at PM6 first cuts the B3LYP opt to a few
+        #    steps. The optimised PM6 geometry replaces the RDKit embed below.
+        sig_pre = signature(canonical, PREOPT_METHOD, "", 0, 1, job_kind="preopt")
+        label_pre = f"{_label(canonical, sig_pre)}_n{n}_preopt"
+
+        def _build_preopt(atoms=initial, lbl=label_pre):
+            return gaussian.write_com_preopt(
+                atoms,
+                charge=0,
+                mult=1,
+                nproc=settings.gaussian_nproc,
+                mem=settings.gaussian_mem,
+                label=lbl,
+                chk=f"{lbl}.chk",
+            )
+
+        job_pre = db.Job(
+            id=None,
+            signature=sig_pre,
+            smiles=canonical,
+            method=PREOPT_METHOD,
+            basis="",
+            charge=0,
+            mult=1,
+            job_kind="preopt",
+            status="pending",
+            submitted_at=_now(),
+            workflow_id=wf_id,
+            notes=f"n{n}_preopt",
+        )
+        pre = runner.resolve(job_pre, label_pre, _build_preopt, wait=True, need_log=True)
+        if pre.status != "complete":
+            return _fail(conn, wf_id, stdout, "preopt", n, pre.status)
+        initial = geometry_loader(pre.log_path)  # B3LYP opt starts from the PM6 geometry
+
         # 1. properties (B3LYP opt) — HOMO, KS gap, optimised geometry.
         sig_p = signature(canonical, OPT_METHOD, BASIS, 0, 1)
         label_p = f"{_label(canonical, sig_p)}_n{n}_opt"
@@ -84,6 +122,10 @@ def run_oligomer_sweep(
                 mem=settings.gaussian_mem,
                 label=lbl,
                 chk=f"{lbl}.chk",
+                # Floppy TVT backbones thrash a default-trust-radius opt (job 71248);
+                # damp it and accept loose convergence — HOMO/gap/optical are
+                # insensitive to the last bit of geometry. See write_com_properties.
+                opt_route="opt=(loose,maxstep=10,maxcycles=300)",
             )
 
         job_p = db.Job(

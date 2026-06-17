@@ -44,8 +44,22 @@ def write_com_properties(
     mem: str,
     label: str,
     chk: str,
+    opt_route: str = "opt",
 ) -> str:
-    """Return the .com text for an opt + pop=full properties job."""
+    """Return the .com text for an opt + pop=full properties job.
+
+    ``opt_route`` is the bare opt keyword. Default ``"opt"`` keeps the tight
+    default convergence that λ_h needs (reorganisation energy is sensitive to the
+    neutral/cation geometry difference, so those opts must NOT be loosened). The
+    oligomer sweep overrides it with damping + loose convergence: floppy backbones
+    (TVT thienylene-vinylene arms) give a near-flat PES where the default trust
+    radius overshoots — FBT n=1 thrashed with Max Displacement ~0.7 (target 0.0018)
+    and ran to the 462-step cap without converging (job 71248). HOMO/KS-gap/optical
+    gap are insensitive to the last bit of geometry convergence, so ``loose`` (Max
+    Force 0.0025) is scientifically fine there and ``maxstep=10`` damps the
+    overshoot. (Internal coords kept; if a long-n opt later hits 'FormBX'/'Bend
+    failed' from a near-linear angle, add ``cartesian`` to its ``opt_route`` too.)
+    """
     return _format_com(
         atoms=atoms,
         method=method,
@@ -56,7 +70,71 @@ def write_com_properties(
         mem=mem,
         label=label,
         chk=chk,
-        keywords="opt pop=full",
+        # scf=(xqc,vshift=100): long conjugated oligomers have near-degenerate
+        # frontier orbitals (Gap≈0.02-0.06 au) where plain DIIS oscillates.
+        # vshift level-shifts the virtuals so DIIS converges cheaply (xqc alone
+        # converged but fell back to quadratic-convergence EVERY opt step ≈ 5h/step,
+        # impractical over an opt). xqc stays as the safety net if DIIS still stalls.
+        # vshift=300 over-shifted (≫ gap): on some conformers DIIS stalled at
+        # RMSDP≈1e-6, never reached the tight criterion, fell to xqc and hung >15h
+        # on the FIRST SCF point (job f665f0c6, 0 SCF Done). vshift=100 (~2x the
+        # gap) still aids DIIS but converges tight. Do NOT raise back to 300
+        # (stalls) or drop to 0 (5h/step). No-op cost when DIIS already converges.
+        keywords=f"{opt_route} pop=full scf=(xqc,vshift=100)",
+    )
+
+
+def write_com_preopt(
+    atoms,
+    charge: int,
+    mult: int,
+    nproc: int,
+    mem: str,
+    label: str,
+    chk: str,
+    method: str = "pm6",
+) -> str:
+    """Return the .com text for a cheap semi-empirical geometry pre-optimisation.
+
+    Large conjugated oligomers (n=3) start far from their minimum, so a direct
+    B3LYP/6-31G** opt thrashes — huge RMS displacement, ~14 h/step, effectively
+    never converging (job 71235, 5 steps in 3 days). A PM6 pre-opt lands a
+    near-physical geometry far more cheaply; feeding that into the B3LYP opt cuts
+    it to a handful of steps. PM6 is semi-empirical: no basis set.
+
+    Two robustness flags, both forced by the n=3 backbone:
+
+    * ``scf=(xqc,vshift=300)`` — the near-degenerate frontier (Gap≈0.1 eV at n=3)
+      is a property of the conjugated system, NOT the functional, so PM6's SCF
+      hits the SAME DIIS oscillation B3LYP does; plain PM6 dies with 'Convergence
+      failure' at l502 (job 71238).
+    * ``opt=cartesian`` — as the long oligomer relaxes it passes through a
+      near-linear (≈180°) bond angle, which makes Gaussian's redundant *internal*
+      coordinates singular ('Bend failed' → 'FormBX had a problem', l103 error
+      termination, job 71239 — after 34 good steps). Optimising in Cartesian
+      coordinates sidesteps the B-matrix entirely. Cheap here: PM6 is ~15 s/step.
+    * ``loose,maxstep=10,maxcycles=300`` — a pre-opt only needs a near-physical
+      geometry to seed the B3LYP opt; it does NOT need a tight stationary point.
+      Floppy TVT backbones (soft thienylene-vinylene + 2D side-arm torsions) give a
+      near-flat PES: the default trust radius overshoots, so Max Force oscillates
+      and never settles even at the ``loose`` 0.0025 target — PBDT-TVT-FBT n=1 hit
+      'Number of steps exceeded, NStep=241' first at the tight default (job 71241),
+      then again with ``loose`` alone, oscillating 0.003–0.007 just above 0.0025
+      (job 71244). ``loose`` relaxes convergence ~10x; ``maxstep=10`` (0.1 Bohr cap)
+      damps the overshoot so it settles; ``maxcycles=300`` gives the smaller steps
+      room. Harmless to the result: the B3LYP opt tightens the geometry afterward.
+    """
+    return _format_com(
+        atoms=atoms,
+        method=method,
+        basis="",  # semi-empirical: no basis set
+        charge=charge,
+        mult=mult,
+        nproc=nproc,
+        mem=mem,
+        label=label,
+        chk=chk,
+        keywords="opt=(cartesian,loose,maxstep=10,maxcycles=300) scf=(xqc,vshift=300)",  # see docstring
     )
 
 
@@ -86,7 +164,7 @@ def write_com_sp(
         mem=mem,
         label=label,
         chk=chk,
-        keywords="pop=full",
+        keywords="pop=full scf=(xqc,vshift=300)",  # robust SCF — see write_com_properties
     )
 
 
@@ -113,7 +191,7 @@ def write_com_tddft(
         mem=mem,
         label=label,
         chk=chk,
-        keywords=f"td=(nstates={nstates})",
+        keywords=f"td=(nstates={nstates}) scf=(xqc,vshift=100)",  # robust SCF — see write_com_properties
     )
 
 
@@ -130,11 +208,13 @@ def _format_com(
     chk: str,
     keywords: str,
 ) -> str:
+    # Semi-empirical methods (e.g. PM6) take no basis set — emit a bare method.
+    route = f"{method}/{basis}" if basis else method
     header = [
         f"%nprocshared={nproc}",
         f"%mem={mem}",
         f"%chk={chk}",
-        f"#p {method}/{basis} {keywords}",
+        f"#p {route} {keywords}",
         "",
         label,
         "",

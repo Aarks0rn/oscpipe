@@ -3,21 +3,24 @@
 Security policy (locked):
     - paramiko.RejectPolicy + known_hosts for host keys
     - SSH private key only (settings.remote_key_file); password mode is disallowed
-    - First-time setup: user runs `ssh user@203.0.113.10` once to pin the
+    - First-time setup: user runs `ssh user@host` once to pin the
       fingerprint, then `ssh-copy-id` to install the laptop's public key.
 
-Implements `oscpipe.dispatch.base.Backend`. UGE (qsub) on the workstation.
+Implements the backend contract (submit / poll / fetch_log / cancel). g16 is launched
+directly over SSH with `nohup ... & echo $!`; the shell PID is the job id, polled with
+`kill -0`. The host has no batch scheduler (no qsub/qstat) — jobs run as soon as they
+launch, so pace submissions yourself.
 """
 
 from __future__ import annotations
 
 import os
 import re
-from typing import Literal
+
+from paramiko.ssh_exception import SSHException
 
 from ..settings import Settings
-
-JobStatus = Literal["pending", "running", "complete", "error", "unknown"]
+from . import JobStatus
 
 
 class SshBackend:
@@ -56,6 +59,11 @@ class SshBackend:
             look_for_keys=False,
             allow_agent=False,
         )
+        # λ_h workflows poll over this one connection for ~a day; a keepalive
+        # stops the workstation/NAT from dropping it during idle poll gaps.
+        transport = client.get_transport()
+        if transport is not None:
+            transport.set_keepalive(30)
         return client, client.open_sftp()
 
     def _ensure_open(self):
@@ -69,12 +77,39 @@ class SshBackend:
             self._ssh.close()
         self._ssh = self._sftp = None
 
+    def _reset(self) -> None:
+        """Drop the (likely dead) connection so the next call reconnects."""
+        for handle in (self._sftp, self._ssh):
+            try:
+                if handle is not None:
+                    handle.close()
+            except Exception:
+                pass
+        self._ssh = self._sftp = None
+
     # ── shell helper ───────────────────────────────────────────────────────
 
-    def _run(self, cmd: str) -> tuple[str, str]:
+    def _exec(self, cmd: str) -> tuple[str, str]:
         self._ensure_open()
         _, stdout, stderr = self._ssh.exec_command(cmd)
         return stdout.read().decode(), stderr.read().decode()
+
+    def _run(self, cmd: str, *, retry: bool = True) -> tuple[str, str]:
+        try:
+            return self._exec(cmd)
+        except (OSError, EOFError, SSHException):
+            # The workstation dropped an idle connection mid-workflow — seen as
+            # ConnectionResetError (OSError) during a poll, or once the paramiko
+            # transport has gone inactive, SSHException("SSH session not active")
+            # (crashed the diF sweep, job 178). Reconnect once and retry so a
+            # transient drop doesn't crash the whole multi-hour run.
+            # retry=False for non-idempotent commands (launch): a reset between the
+            # command running server-side and reading its reply would otherwise
+            # re-submit and orphan the first job.
+            if not retry:
+                raise
+            self._reset()
+            return self._exec(cmd)
 
     # ── Backend protocol ───────────────────────────────────────────────────
 
@@ -85,45 +120,46 @@ class SshBackend:
 
         remote_com = f"{remote_dir}/{label}.com"
         remote_log = f"{remote_dir}/{label}.log"
-        remote_script = f"{remote_dir}/{label}.qsub.sh"
 
         self._sftp.put(com_path, remote_com)
 
-        script = _qsub_script(
-            remote_dir=remote_dir,
-            label=label,
-            nproc=self.s.gaussian_nproc,
-            pe=self.s.remote_pe,
-            exe=self.s.gaussian_exe,
-            scratch_dir=self.s.scratch_dir,
-        )
-        # paramiko exec for the heredoc-free write: use a sftp file handle.
-        with self._sftp.open(remote_script, "w") as f:
-            f.write(script)
-        self._sftp.chmod(remote_script, 0o755)
+        # Clear any stale .log/.chk from a prior run of THIS label (the label hash
+        # is route-independent, so a re-run reuses the filename). Without this the
+        # poll() below could read the previous run's "Error termination".
+        self._run(f"rm -f {remote_log} {remote_dir}/{label}.chk", retry=False)
 
-        out, err = self._run(f"cd {remote_dir} && qsub {label}.qsub.sh")
-        jobid = _parse_qsub_jobid(out)
-        if jobid is None:
-            raise RuntimeError(f"qsub returned no job id. stdout={out!r} stderr={err!r}")
-        self._jobs[jobid] = remote_log
-        return jobid
+        scrdir = f"GAUSS_SCRDIR={self.s.scratch_dir} " if self.s.scratch_dir else ""
+        # nohup detaches g16 from the SSH channel so it survives once paramiko
+        # closes the exec channel; `echo $!` prints the launched PID. retry=False:
+        # a reconnect mid-launch would relaunch and orphan the first g16.
+        launch = (
+            f"cd {remote_dir} && "
+            f"nohup {scrdir}{self.s.gaussian_exe} {label}.com {label}.log "
+            f">/dev/null 2>&1 & echo $!"
+        )
+        out, err = self._run(launch, retry=False)
+        pid = _parse_pid(out)
+        if pid is None:
+            raise RuntimeError(f"launch returned no PID. stdout={out!r} stderr={err!r}")
+        self._jobs[pid] = remote_log
+        return pid
 
     def poll(self, remote_job_id: str) -> JobStatus:
-        out, _ = self._run(f"qstat -j {remote_job_id} 2>&1")
-        low = out.lower()
-        if "eqw" in low or "error" in low and "do not exist" not in low:
-            # qstat reports a queue-side error.
-            return "error"
-        if "do not exist" in low or "not found" in low:
-            # Job left the queue. Inspect the log to decide complete vs error.
-            log_path = self._jobs.get(remote_job_id)
-            if log_path is None:
-                return "unknown"
-            return self._poll_log(log_path)
-        if " r " in low or "running" in low:
+        out, _ = self._run(f"kill -0 {remote_job_id} 2>/dev/null && echo ALIVE || echo DEAD")
+        if "ALIVE" in out:
             return "running"
-        return "pending"
+        # Process is gone — decide from the log.
+        log_path = self._jobs.get(remote_job_id)
+        if log_path is None:
+            return "unknown"
+        status = self._poll_log(log_path)
+        # _poll_log assumes a scheduler may not have started the job yet, so it
+        # returns "pending"/"running" when the log is missing or unfinished. But
+        # here the process has already exited, so an unfinished/absent log means
+        # g16 died without completing → error.
+        if status in ("pending", "running"):
+            return "error"
+        return status
 
     def _poll_log(self, remote_log_path: str) -> JobStatus:
         # If the log doesn't exist yet, UGE hasn't started the job — treat as pending,
@@ -154,10 +190,10 @@ class SshBackend:
         return local_path
 
     def cancel(self, remote_job_id: str) -> None:
-        self._run(f"qdel {remote_job_id}")
+        self._run(f"kill {remote_job_id} 2>/dev/null || true")
 
     def preflight(self) -> list[tuple[str, bool, str]]:
-        """Health-check the remote workstation. Returns [(name, passed, message)]."""
+        """Health-check the host. Returns [(name, passed, message)]."""
         results = []
 
         # 1. g16 on PATH
@@ -165,19 +201,13 @@ class SshBackend:
         g16_path = out.strip()
         results.append(("g16", bool(g16_path), g16_path or "not found in PATH"))
 
-        # 2. qstat exists (job 0 won't exist; UGE still prints "do not exist: 0")
-        out, _ = self._run("qstat -j 0 2>&1 || true")
-        low = out.lower()
-        qstat_ok = "do not exist" in low or "unknown job" in low or "following" in low
-        results.append(("qstat", qstat_ok, out.strip()[:80] if qstat_ok else "qstat not found"))
-
-        # 3. scratch_dir writable
+        # 2. work_dir writable (no scheduler on this host → no qstat check)
         remote_dir = self.s.remote_work_dir.rstrip("/")
         probe = f"{remote_dir}/.preflight_probe"
-        out, err = self._run(f"touch {probe} && rm {probe} && echo ok")
+        out, err = self._run(f"mkdir -p {remote_dir} && touch {probe} && rm {probe} && echo ok")
         writable = out.strip() == "ok"
         results.append(
-            ("scratch", writable, remote_dir if writable else f"not writable: {err.strip()[:60]}")
+            ("work_dir", writable, remote_dir if writable else f"not writable: {err.strip()[:60]}")
         )
 
         return results
@@ -197,23 +227,7 @@ def _ensure_remote_dir(sftp, remote_dir: str) -> None:
             sftp.mkdir(path)
 
 
-def _qsub_script(
-    *, remote_dir: str, label: str, nproc: int, pe: str, exe: str, scratch_dir: str = ""
-) -> str:
-    pe_line = f"#$ -pe {pe} {nproc}\n" if nproc > 1 else ""
-    job_name = label[:64]  # UGE job name (max ~64 chars)
-    scrdir_line = f"export GAUSS_SCRDIR={scratch_dir}\n" if scratch_dir else ""
-    return (
-        "#!/bin/sh\n"
-        "#$ -S /bin/sh\n"
-        "#$ -V\n"
-        f"#$ -N {job_name}\n" + pe_line + "#$ -q all.q\n"
-        "#$ -cwd\n"
-        "#$ -j y\n"
-        f"cd {remote_dir}\n" + scrdir_line + f"{exe} {label}.com {label}.log\n"
-    )
-
-
-def _parse_qsub_jobid(qsub_stdout: str) -> str | None:
-    m = re.search(r"\bjob[- ]?(?:array )?(\d+)", qsub_stdout, re.IGNORECASE)
-    return m.group(1) if m else None
+def _parse_pid(stdout: str) -> str | None:
+    """Return the last integer token in stdout (the `echo $!` PID), or None."""
+    ids = re.findall(r"\d+", stdout)
+    return ids[-1] if ids else None

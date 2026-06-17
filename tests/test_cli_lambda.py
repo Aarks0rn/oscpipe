@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+from pathlib import Path
 
 import ase
 import numpy as np
-
 from _helpers import StubBackend, synth_log
 
 from oscpipe.chem.geometry import build_pi_stack_dimer
@@ -108,6 +108,67 @@ def test_lambda_computes_lambda_h(tmp_path, capsys):
     assert "lambda_h = 2.7211 eV" in out
     assert "J_hole" in out
     assert "marcus_rate" in out
+
+
+class _ConcBackend:
+    """Tracks peak concurrent in-flight jobs. Each job polls 'running' once, then
+    'complete', so jobs in the same layer genuinely overlap."""
+
+    def __init__(self, log_provider):
+        self.active = 0
+        self.max_active = 0
+        self._polls: dict[str, int] = {}
+        self._label: dict[str, str] = {}
+        self._jobs: dict[str, str] = {}
+        self.log_provider = log_provider
+
+    def submit(self, com_path, label):
+        sid = f"stub-{label}"
+        self.active += 1
+        self.max_active = max(self.max_active, self.active)
+        self._polls[sid] = 0
+        self._label[sid] = label
+        return sid
+
+    def poll(self, sid):
+        self._polls[sid] += 1
+        return "running" if self._polls[sid] <= 1 else "complete"
+
+    def fetch_log(self, sid, label, local_dir):
+        self.active -= 1
+        Path(local_dir).mkdir(parents=True, exist_ok=True)
+        out = Path(local_dir) / f"{label}.log"
+        out.write_text(self.log_provider(label))
+        return str(out)
+
+    def cancel(self, sid):
+        pass
+
+
+def test_lambda_runs_opts_in_parallel_and_matches_serial(tmp_path):
+    s = Settings(
+        backend="local",
+        db_path=str(tmp_path / "results.db"),
+        gaussian_nproc=10,
+        gaussian_mem="24GB",
+        poll_interval_seconds=0,
+        max_lanes=2,
+    )
+    backend = _ConcBackend(_log_for)
+    conn = db.open(s.db_path)
+    from oscpipe.chem.smiles import embed_3d
+
+    initial = embed_3d("c1ccccc1")
+    rc = run_lambda(_args(), s, backend, conn, geometry_loader=lambda _: initial)
+    assert rc == 0
+    # Two lanes were actually used — the neutral/cation opts overlapped.
+    assert backend.max_active == 2
+    summary = json.loads(
+        conn.execute("SELECT summary_json FROM workflows").fetchone()["summary_json"]
+    )
+    # Same physics as the serial path (test_lambda_computes_lambda_h).
+    assert abs(summary["lambda_h_ev"] - 2.72114) < 1e-2
+    assert summary["j_hole_ev"] is not None
 
 
 def test_lambda_opt_stage_failure_marks_workflow_error(tmp_path, capsys):

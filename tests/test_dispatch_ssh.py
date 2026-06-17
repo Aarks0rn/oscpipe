@@ -1,7 +1,9 @@
-"""SshBackend tests with paramiko mocked.
+"""SshBackend connection + policy tests with paramiko mocked.
 
 We inject a fake connect callable that yields a FakeSSH + FakeSFTP. The
-paramiko module is never imported; tests run without network access.
+paramiko module is never imported; tests run without network access. The
+submit/poll/cancel/preflight launch lifecycle is covered in
+test_dispatch_ssh_direct.py, which reuses the fakes defined here.
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from oscpipe.dispatch.ssh import SshBackend, _parse_qsub_jobid
+from oscpipe.dispatch.ssh import SshBackend
 from oscpipe.settings import Settings
 
 # ── fakes ──────────────────────────────────────────────────────────────────
@@ -125,40 +127,7 @@ def test_refuses_empty_host(tmp_path):
         SshBackend(s)
 
 
-# ── submit ─────────────────────────────────────────────────────────────────
-
-
-def test_submit_uploads_com_and_returns_jobid(fake_settings, tmp_path):
-    com = tmp_path / "h2.com"
-    com.write_text("%chk=h2.chk\n#p b3lyp/6-31g* opt\n\nh2\n\n0 1\nH 0 0 0\nH 0.74 0 0\n\n")
-
-    ssh = FakeSSH()
-    ssh.stdout_for["qsub"] = b'Your job 70867 ("h2") has been submitted\n'
-    sftp = FakeSFTP()
-    backend = _backend(fake_settings, ssh, sftp)
-
-    jobid = backend.submit(str(com), "h2")
-    assert jobid == "70867"
-    # com was uploaded to the remote work dir
-    assert any(local == str(com) and remote.endswith("/h2.com") for local, remote in sftp.put_calls)
-    # qsub script was written
-    assert any(path.endswith("/h2.qsub.sh") for path in sftp.opened)
-    # qsub was run
-    assert any("qsub h2.qsub.sh" in c for c in ssh.cmds)
-
-
-def test_submit_raises_when_qsub_returns_no_jobid(fake_settings, tmp_path):
-    com = tmp_path / "x.com"
-    com.write_text("")
-    ssh = FakeSSH()
-    ssh.stdout_for["qsub"] = b"submit failed: queue is full\n"
-    sftp = FakeSFTP()
-    backend = _backend(fake_settings, ssh, sftp)
-    with pytest.raises(RuntimeError, match="qsub"):
-        backend.submit(str(com), "x")
-
-
-# ── poll ───────────────────────────────────────────────────────────────────
+# ── fetch_log ──────────────────────────────────────────────────────────────
 
 
 def _submitted_backend(
@@ -175,51 +144,6 @@ def _submitted_backend(
     return backend, ssh, sftp
 
 
-def test_poll_running(fake_settings):
-    backend, ssh, _ = _submitted_backend(fake_settings)
-    ssh.stdout_for["qstat"] = b"job_number: 12345\njob_state: r running\n"
-    assert backend.poll("12345") == "running"
-
-
-def test_poll_complete(fake_settings):
-    backend, ssh, _ = _submitted_backend(fake_settings)
-    ssh.stdout_for["qstat"] = b"Following jobs do not exist: 12345\n"
-    ssh.stdout_for["tail -c"] = b" Normal termination of Gaussian 16 at ...\n"
-    assert backend.poll("12345") == "complete"
-
-
-def test_poll_error(fake_settings):
-    backend, ssh, _ = _submitted_backend(fake_settings)
-    ssh.stdout_for["qstat"] = b"Following jobs do not exist: 12345\n"
-    ssh.stdout_for["tail -c"] = b"Error termination via Lnk1e\n"
-    assert backend.poll("12345") == "error"
-
-
-def test_poll_eqw_returns_error(fake_settings):
-    backend, ssh, _ = _submitted_backend(fake_settings)
-    ssh.stdout_for["qstat"] = b"job 12345 state: Eqw\n"
-    assert backend.poll("12345") == "error"
-
-
-def test_poll_unknown_jobid(fake_settings):
-    backend, ssh, _ = _submitted_backend(fake_settings)
-    # No map entry for this jobid.
-    backend._jobs.clear()
-    ssh.stdout_for["qstat"] = b"Following jobs do not exist: 99\n"
-    assert backend.poll("99") == "unknown"
-
-
-def test_poll_pending_when_log_absent(fake_settings):
-    """UGE accounting race: qstat says 'do not exist' before scheduler picks it up,
-    log file not yet created — must be 'pending', not 'unknown' (would mark job error)."""
-    backend, ssh, _ = _submitted_backend(fake_settings, log_exists=False)
-    ssh.stdout_for["qstat"] = b"Following jobs do not exist: 12345\n"
-    assert backend.poll("12345") == "pending"
-
-
-# ── fetch_log ──────────────────────────────────────────────────────────────
-
-
 def test_fetch_log_downloads_to_local_dir(fake_settings, tmp_path):
     backend, _, sftp = _submitted_backend(fake_settings)
     out = tmp_path / "out"
@@ -229,25 +153,60 @@ def test_fetch_log_downloads_to_local_dir(fake_settings, tmp_path):
     assert sftp.get_calls == [("/home/user/work/x.log", str(out / "x.log"))]
 
 
-# ── cancel ─────────────────────────────────────────────────────────────────
+# ── reconnect on dropped connection ─────────────────────────────────────────
 
 
-def test_cancel_runs_qdel(fake_settings):
-    backend, ssh, _ = _submitted_backend(fake_settings)
-    backend.cancel("12345")
-    assert any("qdel 12345" in c for c in ssh.cmds)
+def test_run_reconnects_after_connection_reset(fake_settings):
+    """A long λ_h run polls over one connection for hours; the workstation can
+    reset it mid-run. _run must reconnect once and retry, not crash."""
+    bad = FakeSSH()
+
+    def boom(cmd):
+        bad.cmds.append(cmd)
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+    bad.exec_command = boom
+    good = FakeSSH()
+    good.default_stdout = b"ALIVE\n"
+    conns = iter([(bad, FakeSFTP()), (good, FakeSFTP())])
+    backend = SshBackend(fake_settings, _connect=lambda: next(conns))
+
+    out, _ = backend._run("kill -0 1")
+    assert "ALIVE" in out             # served by the healthy reconnect
+    assert bad.cmds and good.cmds     # first conn tried, then retried on the second
 
 
-# ── qsub parser unit ───────────────────────────────────────────────────────
+def test_run_reconnects_after_ssh_session_not_active(fake_settings):
+    """After hours of polling the paramiko transport can go inactive; exec_command
+    then raises SSHException, not an OSError. _run must still reconnect+retry — this
+    is the exact drop that crashed the diF sweep ('SSH session not active')."""
+    from paramiko.ssh_exception import SSHException
+
+    bad = FakeSSH()
+
+    def boom(cmd):
+        bad.cmds.append(cmd)
+        raise SSHException("SSH session not active")
+
+    bad.exec_command = boom
+    good = FakeSSH()
+    good.default_stdout = b"ALIVE\n"
+    conns = iter([(bad, FakeSFTP()), (good, FakeSFTP())])
+    backend = SshBackend(fake_settings, _connect=lambda: next(conns))
+
+    out, _ = backend._run("kill -0 1")
+    assert "ALIVE" in out             # served by the healthy reconnect
+    assert bad.cmds and good.cmds     # first conn tried, then retried on the second
 
 
-@pytest.mark.parametrize(
-    "stdout,expected",
-    [
-        ('Your job 70867 ("h2") has been submitted\n', "70867"),
-        ("Your job-array 1234.1-10:1 has been submitted\n", "1234"),
-        ("submit failed: queue full\n", None),
-    ],
-)
-def test_parse_qsub_jobid(stdout, expected):
-    assert _parse_qsub_jobid(stdout) == expected
+def test_run_reraises_if_reconnect_also_fails(fake_settings):
+    """Retry is exactly once — a persistent failure propagates, no infinite loop."""
+
+    def make_boom():
+        s = FakeSSH()
+        s.exec_command = lambda cmd: (_ for _ in ()).throw(ConnectionResetError(104, "reset"))
+        return s, FakeSFTP()
+
+    backend = SshBackend(fake_settings, _connect=lambda: make_boom())
+    with pytest.raises(ConnectionResetError):
+        backend._run("kill -0 1")

@@ -21,3 +21,14 @@ def test_kwargs_beat_env(monkeypatch):
     monkeypatch.setenv("OSC_REMOTE_HOST", "from-env")
     s = load(remote_host="from-kwargs")
     assert s.remote_host == "from-kwargs"
+
+
+def test_max_lanes_default_is_one():
+    # Dataclass default (not load(), which reads config.local.toml) — serial unless set.
+    assert Settings().max_lanes == 1
+
+
+def test_max_lanes_env_override(monkeypatch):
+    monkeypatch.setenv("OSC_MAX_LANES", "2")
+    s = load()
+    assert s.max_lanes == 2

@@ -24,7 +24,7 @@ _FIXTURES = Path(__file__).parent / "fixtures"
 
 @pytest.mark.real
 def test_real_preflight_passes(real_settings, capsys):
-    """SSH connect, which g16, qstat, scratch writable — all green."""
+    """SSH connect, which g16, work_dir writable — all green."""
     from oscpipe.dispatch.ssh import SshBackend
 
     conn = db.open(real_settings.db_path)
@@ -37,13 +37,12 @@ def test_real_preflight_passes(real_settings, capsys):
     assert rc == 0
     out = capsys.readouterr().out
     assert "g16: [ok]" in out
-    assert "qstat: [ok]" in out
-    assert "scratch: [ok]" in out
+    assert "work_dir: [ok]" in out
 
 
 @pytest.mark.real
 def test_real_submit_h2_full_cycle(real_settings, tmp_path):
-    """Submit H2 (HF/STO-3G) via qsub; poll until complete; parse HOMO/LUMO."""
+    """Submit H2 (HF/STO-3G) via nohup g16; poll until complete; parse HOMO/LUMO."""
     import ase
     from oscpipe.dispatch.ssh import SshBackend
 

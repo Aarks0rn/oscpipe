@@ -12,13 +12,18 @@ dispatch  → Backend protocol; SSH-only for first cut (paramiko, key-only, stri
 store     → SQLite, two tables (jobs + results) + workflows + view, explicit schema.sql
 analysis  → Marcus (λ_reorg + rate), Indo (transfer integral), UV-Vis broadening
 run       → JobRunner.resolve: resolve one Gaussian job to its result — signature
-            cache hit, else submit → poll/wait → fetch → parse → persist by
-            job_kind. Single entry for the CLI single-shot commands and every
-            workflow step; owns the remote-label + total persist-by-kind conventions.
+            cache hit, else reattach to an in-flight job of the same signature
+            (orphan prevention, ADR 0005), else submit → poll/wait → fetch →
+            parse → persist by job_kind. Single entry for the CLI single-shot
+            commands and every workflow step; owns the remote-label + total
+            persist-by-kind conventions.
 workflows → multi-job sequences. `lambda_h.run_lambda_h` composes the 5 jobs
             (4-point Nelsen + π-stacked dimer SP) via JobRunner, then derives the
             physics through the `analysis` functions (no inline arithmetic).
-cli       → `oscpipe submit | batch | lambda | uvvis | status | fetch | reconcile | preflight`
+            `screen.run_screen` is the campaign: properties → TD-DFT → λ_h per
+            candidate, sequential + blocking, resume via the signature cache
+            (ADR 0004).
+cli       → `oscpipe submit | batch | screen | lambda | uvvis | status | fetch | reconcile | orphans | preflight | export`
 app/      → Streamlit multipage: 1_Properties.py + 2_Workstation.py
 ```
 
@@ -60,4 +65,4 @@ disallowed at the type level (no `remote_password` field exists in `Settings`).
 ## Scope-creep gate
 
 Any feature outside the four workflows above requires an ADR in `docs/adr/`
-before implementation.
+before implementation. (`screen` + `export`: ADR 0004.)

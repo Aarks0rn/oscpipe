@@ -4,6 +4,7 @@ Schema lives in schema.sql — open() applies it idempotently.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,6 +49,13 @@ class Result:
 def open(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    # Concurrency posture. WAL lets the Streamlit dashboard (and any second oscpipe
+    # process) read while the CLI writes without "database is locked"; busy_timeout
+    # makes a writer wait for a competing write rather than erroring immediately.
+    # WAL is persistent on the file; busy_timeout is per-connection. Needs a local
+    # filesystem (results.db is local) — do not move the DB to a network mount.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     conn.executescript(SCHEMA.read_text())
     return conn
 
@@ -147,3 +155,123 @@ def find_complete_by_signature(conn: sqlite3.Connection, signature: str):
         "ORDER BY id DESC LIMIT 1",
         (signature,),
     ).fetchone()
+
+
+def find_inflight_by_signature(conn: sqlite3.Connection, signature: str):
+    """Return the most recent pending/running job row with this signature that
+    has a recorded ssh_jobid, or None.
+
+    Used to reattach to an already-queued job instead of submitting a duplicate
+    — the main source of orphan UGE jobs is a detached run (Ctrl-C / disconnect)
+    that leaves a 'running' row + live remote job, then a re-run resubmitting
+    because the cache only matches 'complete'.
+    """
+    return conn.execute(
+        "SELECT * FROM jobs "
+        "WHERE signature = ? AND status IN ('pending', 'running') "
+        "AND ssh_jobid IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (signature,),
+    ).fetchone()
+
+
+# ── read API for external consumers (project scripts, `oscpipe export`) ─────
+# The one home for "what shape do results take when they leave the store" —
+# scripts use these instead of writing raw SQL against the schema.
+
+
+def list_complete_oligomer_sweeps(conn: sqlite3.Connection) -> list[dict]:
+    """Parsed summary of every complete oligomer_sweep workflow, oldest first.
+
+    Each dict is the workflow's summary_json ("repeat_unit", "max_n", "per_n",
+    "extrapolated", ...) plus "workflow_id" and "smiles" from the row.  Rows
+    with no summary are skipped.  Oldest-first iteration gives callers keying
+    by repeat unit newest-wins semantics.
+    """
+    out: list[dict] = []
+    for row in conn.execute(
+        "SELECT id, smiles, summary_json FROM workflows "
+        "WHERE kind = 'oligomer_sweep' AND status = 'complete' "
+        "AND summary_json IS NOT NULL ORDER BY id"
+    ):
+        summary = json.loads(row["summary_json"])
+        summary["workflow_id"] = row["id"]
+        summary["smiles"] = row["smiles"]
+        out.append(summary)
+    return out
+
+
+def candidate_summary(conn: sqlite3.Connection, smiles: str) -> dict:
+    """Latest complete results for one canonical SMILES, joined across the
+    three sources: properties job (HOMO/LUMO/gap), tddft job (brightest state),
+    lambda_h workflow (λ_h / J / Marcus rate).  Missing pieces are None.
+
+    No physics here — this only reshapes stored rows.
+    """
+    out: dict = {
+        "smiles": smiles,
+        "homo_ev": None,
+        "lumo_ev": None,
+        "gap_ev": None,
+        "lambda_max_nm": None,
+        "f_osc": None,
+        "lambda_h_ev": None,
+        "j_hole_ev": None,
+        "marcus_rate_s1": None,
+    }
+    # charge=0 keeps cation_opt rows (also job_kind='properties') out.
+    row = conn.execute(
+        "SELECT r.homo_ev, r.lumo_ev, r.gap_ev FROM jobs j "
+        "JOIN results r ON r.job_id = j.id "
+        "WHERE j.smiles = ? AND j.job_kind = 'properties' AND j.charge = 0 "
+        "AND j.status = 'complete' ORDER BY j.id DESC LIMIT 1",
+        (smiles,),
+    ).fetchone()
+    if row is not None:
+        out["homo_ev"] = row["homo_ev"]
+        out["lumo_ev"] = row["lumo_ev"]
+        out["gap_ev"] = row["gap_ev"]
+
+    row = conn.execute(
+        "SELECT r.spectra_json FROM jobs j JOIN results r ON r.job_id = j.id "
+        "WHERE j.smiles = ? AND j.job_kind = 'tddft' AND j.status = 'complete' "
+        "AND r.spectra_json IS NOT NULL ORDER BY j.id DESC LIMIT 1",
+        (smiles,),
+    ).fetchone()
+    if row is not None:
+        states = json.loads(row["spectra_json"])
+        if states:
+            bright = max(states, key=lambda s: s["f"])
+            out["lambda_max_nm"] = bright["wavelength_nm"]
+            out["f_osc"] = bright["f"]
+
+    row = conn.execute(
+        "SELECT summary_json FROM workflows "
+        "WHERE kind = 'lambda_h' AND smiles = ? AND status = 'complete' "
+        "AND summary_json IS NOT NULL ORDER BY id DESC LIMIT 1",
+        (smiles,),
+    ).fetchone()
+    if row is not None:
+        summary = json.loads(row["summary_json"])
+        out["lambda_h_ev"] = summary.get("lambda_h_ev")
+        out["j_hole_ev"] = summary.get("j_hole_ev")
+        out["marcus_rate_s1"] = summary.get("marcus_rate_s1")
+    return out
+
+
+def list_candidate_smiles(conn: sqlite3.Connection) -> list[str]:
+    """Distinct SMILES with any complete charge-0 properties job, complete
+    tddft job, or complete lambda_h workflow, ordered by SMILES.
+
+    Oligomer n-mer SMILES appear too — they are real molecules with real
+    results; consumers filter if they only want repeat units.
+    """
+    rows = conn.execute(
+        "SELECT smiles FROM jobs "
+        "WHERE job_kind = 'properties' AND charge = 0 AND status = 'complete' "
+        "UNION "
+        "SELECT smiles FROM jobs WHERE job_kind = 'tddft' AND status = 'complete' "
+        "UNION "
+        "SELECT smiles FROM workflows WHERE kind = 'lambda_h' AND status = 'complete' "
+        "ORDER BY smiles"
+    )
+    return [r["smiles"] for r in rows]
